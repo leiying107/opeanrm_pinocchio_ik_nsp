@@ -1,0 +1,70 @@
+# ROS2 / colcon
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+.offline_verify/venv/
+
+# Isolated offline build products
+.offline_verify/build/
+.offline_verify/install/
+.offline_verify/log/
+.offline_verify/archive/
+
+# Generated benchmark data
+.offline_verify/random_benchmark_results/
+
+# Native build outputs
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+
+# Core dumps and logs
+core
+core.*
+*.log
+
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+*.crt
+credentials*
+secrets*
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Archives and large generated files
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z

@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>openarm_pinocchio_nsp</name>
+  <version>0.1.0</version>
+  <description>Null-space-projection Pinocchio IK + offline Cartesian planning for OpenArm v1.0.</description>
+  <license>Apache License 2.0</license>
+  <maintainer email="openarm@enactic.ai">OpenArm</maintainer>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>control_msgs</exec_depend>
+  <exec_depend>trajectory_msgs</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <!-- Pinocchio is a system library (ros-humble-pinocchio), declared for documentation. -->
+  <exec_depend>openarm_description</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

@@ -1,0 +1,45 @@
+TEST_FK_IK.PY ANALYSIS
+=======================
+
+Date: 2026-07-24
+Package: openarm_pinocchio_ik
+
+ORIGINAL SCRIPT ISSUES
+----------------------
+1. No argparse - cannot pass --help or command-line arguments
+2. Hardcoded URDF path: /ros2_ws/install/openarm_description/.../v1.urdf
+3. Running with --help executes main() directly instead of showing help
+
+KINEMATICS.PY INTERFACE
+------------------------
+PinocchioModel Initialization:
+  - Signature: PinocchioModel(urdf_path: str, side: str) -> None
+  - side: "left" or "right"
+  - Loads URDF, extracts joint indices, limits, and EE frame
+
+FK Function:
+  - Signature: fk(q7: np.ndarray) -> tuple[np.ndarray, np.ndarray]
+  - Input: 7 joint angles (rad)
+  - Output: (position[3], quaternion_xyzw[4])
+
+IK Function:
+  - Signature: ik(target_pos, target_quat_xyzw, q_init, max_iters=50, tol=1e-4, damping=1e-2) -> np.ndarray | None
+  - Returns: 7 joint angles if converged, None if failed
+  - Uses damped-least-squares algorithm
+  - Enforces joint limits via np.clip()
+
+Joint Properties:
+  - model.q_idx: Joint indices in full model vector
+  - model.lower: Lower position limits (rad)
+  - model.upper: Upper position limits (rad)
+
+Error Calculation:
+  - Position error: Euclidean norm of position difference
+  - Orientation error: Rotation angle from relative rotation matrix
+  - Formula: acos((trace(R^T * R) - 1) / 2)
+
+HARDWARE CALLS DETECTION
+------------------------
+Scanned for: rclpy, Node, create_publisher, create_subscription
+Result: NONE FOUND
+Conclusion: test_fk_ik.py is PURELY OFFLINE

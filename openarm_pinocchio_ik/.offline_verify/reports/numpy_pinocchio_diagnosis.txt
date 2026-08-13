@@ -1,0 +1,71 @@
+NUMPY/PINOCCHIO DIAGNOSIS REPORT
+=================================
+
+Date: 2026-07-24
+Package: openarm_pinocchio_ik
+
+PYTHON ENVIRONMENT
+------------------
+Executable: /usr/bin/python3
+Version: 3.10.12
+Prefix: /usr
+Base Prefix: /usr
+
+sys.path ORDER:
+  1. /opt/ros/humble/lib/python3.10/site-packages  (Pinocchio location)
+  2. /opt/ros/humble/local/lib/python3.10/dist-packages
+  3. /usr/lib/python310.zip
+  4. /usr/lib/python3.10
+  5. /usr/lib/python3.10/lib-dynload
+  6. /usr/local/lib/python3.10/dist-packages  (NumPy 2.2.6 location)
+  7. ... (various project paths)
+  8. /usr/lib/python3/dist-packages  (System NumPy 1.21.5 location)
+
+NUMPY INSTALLATION
+------------------
+Version 2.2.6 (INCOMPATIBLE with Pinocchio)
+Location: /usr/local/lib/python3.10/dist-packages/numpy/
+Source: pip (user-level installation)
+
+System apt NumPy:
+  Package: python3-numpy
+  Version: 1.21.5-1ubuntu22.04.1 (COMPATIBLE)
+  Location: /usr/lib/python3/dist-packages/numpy/
+
+CONFLICT: User-level NumPy 2.2.6 overrides system NumPy 1.21.5
+         due to sys.path order.
+
+PINOCCHIO INSTALLATION
+----------------------
+Version: 3.9.0
+Package: ros-humble-pinocchio
+Location: /opt/ros/humble/lib/python3.10/site-packages/pinocchio/
+Source: ROS2 Humble apt package
+Compiled for: NumPy 1.x
+
+IMPORT ERROR
+------------
+AttributeError: _ARRAY_API not found
+Segmentation fault when importing pinocchio
+
+CAUSE: Pinocchio compiled with NumPy 1.x ABI is incompatible
+       with NumPy 2.2.6 ABI changes.
+
+ROOT CAUSE ANALYSIS
+------------------
+1. ROS2 Humble Pinocchio was built against NumPy 1.x
+2. User-installed NumPy 2.2.6 in /usr/local/lib/python3.10/dist-packages/
+3. Python loads user site-packages BEFORE dist-packages
+4. NumPy 2.2.6 is loaded instead of system NumPy 1.21.5
+5. Pinocchio fails to import due to ABI mismatch
+
+RESOLUTION OPTIONS
+------------------
+Option 1: Disable user site-packages with PYTHONNOUSERSITE=1
+Option 2: Create isolated venv with numpy<2
+Option 3: Rebuild Pinocchio with NumPy 2.0+ (NOT ATTEMPTED)
+
+NEXT STEPS
+----------
+1. Test PYTHONNOUSERSITE=1 approach
+2. If fails, create venv in .offline_verify/venv

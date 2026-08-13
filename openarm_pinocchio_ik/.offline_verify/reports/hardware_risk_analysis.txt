@@ -1,0 +1,99 @@
+HARDIDGE-RELATED CODE RISK ANALYSIS
+====================================
+
+CRITICAL: These nodes and commands WILL CONTROL REAL HARDWARE if run
+-----------------------------------------------------------------------
+
+HIGH-RISK NODES (NOT EXECUTED)
+-------------------------------
+
+1. ik_node
+   - Subscribes: /openarm_{side}_target_pose
+   - Publishes: /{side}_joint_trajectory_controller/joint_trajectory
+   - Publishes: /{side}_forward_effort_controller/commands
+   - Default rate: 50 Hz
+   - Safety: max_step_rad=0.05 rate-limits joint steps
+   - Risk: Will send trajectory commands to real controllers
+   - IK failure behavior: Logs warning, does NOT publish (safe)
+
+2. move_joints
+   - Reads: /joint_states
+   - Publishes: /{side}_joint_trajectory_controller/joint_trajectory
+   - NO dry-run mode (ALWAYS publishes to hardware)
+   - Risk: Will move real arm from current to target position
+   - NO input validation on joint limits
+
+3. home
+   - Wrapper for move_joints with target=zeros(7)
+   - Same hardware control risks as move_joints
+   - Risk: Will move real arm to zero position
+
+CONTROL TOPICS (NOT TOUCHED)
+----------------------------
+These topics are used by the package but were NOT touched during verification:
+
+  /joint_states (read-only subscription)
+  /openarm_left_target_pose (NOT published)
+  /openarm_right_target_pose (NOT published)
+  /left_joint_trajectory_controller/joint_trajectory (NOT published)
+  /right_joint_trajectory_controller/joint_trajectory (NOT published)
+  /left_forward_effort_controller/commands (NOT published)
+  /right_forward_effort_controller/commands (NOT published)
+
+HOME POSITION SOURCE
+--------------------
+Source: Hardcoded zeros(7) in home.py
+  No configuration file dependency
+  No online fetching
+
+INPUT VALIDATION STATUS
+------------------------
+ik_node:
+  - No validation on target_pose ranges
+  - IK failure prevents publishing (safe)
+  - max_step_rad rate-limits commanded changes
+
+move_joints/home:
+  - No dry-run mode
+  - No validation on joint limits
+  - Assumes valid 7-element input
+  - Will interpolate and publish regardless of joint limits
+
+EFFORT/TORQUE PUBLISHING PATH
+------------------------------
+ik_node -> effort_pub:
+  - Topic: /{side}_forward_effort_controller/commands
+  - Type: Float64MultiArray
+  - Content: Gravity compensation torques from PinocchioModel.gravity()
+  - Condition: Only when enable_gravity_comp=True (default)
+  - Frequency: 50 Hz (control_hz parameter)
+
+IK FAILURE HANDLING
+-------------------
+ik_node behavior when IK does not converge:
+  - Logs warning (throttled to 1 sec)
+  - Returns early from _loop()
+  - Does NOT publish trajectory
+  - Does NOT publish effort
+  - Current joint state remains unchanged
+
+MISSING SAFETY FEATURES
+------------------------
+1. No dry-run mode in move_joints/home
+2. No joint limit validation before publishing
+3. No E-stop integration
+4. No target pose workspace bounds checking
+5. No watchdog timeout handling
+
+EXECUTED HIGH-RISK OPERATIONS: NONE
+------------------------------------
+During this offline verification:
+  - NO hardware nodes were started
+  - NO controllers were activated
+  - NO CAN interfaces were configured
+  - NO trajectory commands were published
+  - NO effort/torque commands were published
+  - NO joint_states were read
+  - NO bringup launch files were executed
+
+CONFIRMATION: All hardware-related code was analyzed ONLY statically.

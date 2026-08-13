@@ -1,0 +1,28 @@
+DEPENDENCY STATUS CHECK
+======================
+
+Date: 2026-07-24
+Environment: Remote server
+
+RESULTS:
+---------
+Python: 3.10.12
+ROS_DISTRO: humble
+NumPy: 2.2.6
+rclpy: OK (module loads)
+ROS message imports: OK
+
+BLOCKED: Pinocchio
+------------------
+Pinocchio is NOT compatible with NumPy 2.2.6
+Error: AttributeError: _ARRAY_API not found
+Cause: Pinocchio was compiled with NumPy 1.x but system has NumPy 2.2.6
+Impact: Segmentation fault when importing pinocchio
+
+RESOLUTION REQUIRED:
+------------------
+Before running kinematics/FK/IK tests, EITHER:
+1. Downgrade NumPy to < 2.0 (e.g., pip install 'numpy<2')
+2. Rebuild Pinocchio with NumPy 2.0+ support
+
+Static analysis will continue without runtime tests.

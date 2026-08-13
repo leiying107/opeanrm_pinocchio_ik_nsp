@@ -1,0 +1,48 @@
+CONSOLE SCRIPT PYTHON DIAGNOSIS
+================================
+
+Date: 2026-07-24
+Directory: /ros2_ws/openarm_pinocchio_ik
+
+CURRENT ENVIRONMENT
+-------------------
+whoami: root
+python3: /usr/bin/python3
+python: /usr/bin/python3
+ros2: /opt/ros/humble/bin/ros2
+colcon: /usr/bin/colcon
+
+VENV ENVIRONMENT (when activated)
+----------------------------------
+Python: /ros2_ws/openarm_pinocchio_ik/.offline_verify/venv/bin/python
+NumPy: 1.26.4 at /ros2_ws/openarm_pinocchio_ik/.offline_verify/venv/lib/python3.10/site-packages/numpy/
+Pinocchio: 3.9.0 at /opt/ros/humble/lib/python3.10/site-packages/pinocchio/
+
+CURRENT CONSOLE SCRIPT
+----------------------
+Location: .offline_verify/install/openarm_pinocchio_ik/lib/openarm_pinocchio_ik/fk
+Shebang: #!/usr/bin/python3
+File Type: Python script, ASCII text executable
+
+PROBLEM IDENTIFIED
+------------------
+The console script shebang points to /usr/bin/python3 (system Python),
+which loads NumPy 2.2.6 from /usr/local/lib/python3.10/dist-packages/.
+
+This causes Pinocchio (compiled for NumPy 1.x) to fail with:
+  AttributeError: _ARRAY_API not found
+  Segmentation fault
+
+ROOT CAUSE
+----------
+When colcon build runs with system Python, setuptools generates
+console scripts with #!/usr/bin/python3 shebang.
+
+The console script does NOT respect the current shell environment
+or virtualenv - it always uses the Python specified in its shebang.
+
+RESOLUTION PLAN
+---------------
+Rebuild using the venv Python as the build interpreter,
+so setuptools generates console scripts with the correct shebang
+pointing to .offline_verify/venv/bin/python.

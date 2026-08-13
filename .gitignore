@@ -1,0 +1,64 @@
+# --- colcon / ROS2 build artifacts ---
+**/build/
+**/install/
+**/log/
+
+# --- Python ---
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Virtual environments (never commit) ---
+venv/
+.venv/
+env/
+*-venv*/
+venv-openarm-ik/
+.meshcat_venv/
+
+# --- Core dumps ---
+core
+core.*
+
+# --- Logs / archives ---
+*.log
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.7z
+
+# --- Offline verification artifacts (keep scripts, drop generated) ---
+.offline_verify/venv/
+.offline_verify/build/
+.offline_verify/install/
+.offline_verify/log/
+.offline_verify/archive/
+.offline_verify/random_benchmark_results/
+
+# --- Test output dumps ---
+test_logs/
+
+# --- Secrets ---
+.env
+.env.*
+*.pem
+*.key
+*.crt
+credentials*
+secrets*
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# --- Claude Code session data ---
+.claude/

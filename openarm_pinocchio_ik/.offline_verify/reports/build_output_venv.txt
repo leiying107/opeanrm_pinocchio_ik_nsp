@@ -1,0 +1,29 @@
+Starting >>> openarm_pinocchio_ik
+running develop
+running egg_info
+creating src/openarm_pinocchio_ik.egg-info
+writing src/openarm_pinocchio_ik.egg-info/PKG-INFO
+writing dependency_links to src/openarm_pinocchio_ik.egg-info/dependency_links.txt
+writing entry points to src/openarm_pinocchio_ik.egg-info/entry_points.txt
+writing requirements to src/openarm_pinocchio_ik.egg-info/requires.txt
+writing top-level names to src/openarm_pinocchio_ik.egg-info/top_level.txt
+writing manifest file 'src/openarm_pinocchio_ik.egg-info/SOURCES.txt'
+reading manifest file 'src/openarm_pinocchio_ik.egg-info/SOURCES.txt'
+writing manifest file 'src/openarm_pinocchio_ik.egg-info/SOURCES.txt'
+running build_ext
+Creating /ros2_ws/openarm_pinocchio_ik/.offline_verify/install/openarm_pinocchio_ik/lib/python3.10/site-packages/openarm-pinocchio-ik.egg-link (link to src)
+Installing fk script to /ros2_ws/openarm_pinocchio_ik/.offline_verify/install/openarm_pinocchio_ik/lib/openarm_pinocchio_ik
+Installing home script to /ros2_ws/openarm_pinocchio_ik/.offline_verify/install/openarm_pinocchio_ik/lib/openarm_pinocchio_ik
+Installing ik_node script to /ros2_ws/openarm_pinocchio_ik/.offline_verify/install/openarm_pinocchio_ik/lib/openarm_pinocchio_ik
+Installing move_joints script to /ros2_ws/openarm_pinocchio_ik/.offline_verify/install/openarm_pinocchio_ik/lib/openarm_pinocchio_ik
+
+Installed /ros2_ws/openarm_pinocchio_ik/.offline_verify/build/openarm_pinocchio_ik/src
+running symlink_data
+creating /ros2_ws/openarm_pinocchio_ik/.offline_verify/install/openarm_pinocchio_ik/share/ament_index
+creating /ros2_ws/openarm_pinocchio_ik/.offline_verify/install/openarm_pinocchio_ik/share/ament_index/resource_index
+creating /ros2_ws/openarm_pinocchio_ik/.offline_verify/install/openarm_pinocchio_ik/share/ament_index/resource_index/packages
+symbolically linking /ros2_ws/openarm_pinocchio_ik/.offline_verify/build/openarm_pinocchio_ik/resource/openarm_pinocchio_ik -> /ros2_ws/openarm_pinocchio_ik/.offline_verify/install/openarm_pinocchio_ik/share/ament_index/resource_index/packages
+symbolically linking /ros2_ws/openarm_pinocchio_ik/.offline_verify/build/openarm_pinocchio_ik/package.xml -> /ros2_ws/openarm_pinocchio_ik/.offline_verify/install/openarm_pinocchio_ik/share/openarm_pinocchio_ik
+Finished <<< openarm_pinocchio_ik [1.94s]
+
+Summary: 1 package finished [2.28s]

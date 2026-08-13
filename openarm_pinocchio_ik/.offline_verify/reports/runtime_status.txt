@@ -1,0 +1,57 @@
+RUNTIME STATUS - BLOCKED
+========================
+
+BUILD RESULT: SUCCESS
+----------------------
+- colcon build completed without errors
+- Exit code: 0
+- Duration: 2.79s
+- All 4 console_scripts installed
+
+INSTALLATION LOCATION
+---------------------
+Prefix: /ros2_ws/openarm_pinocchio_ik/.offline_verify/install/openarm_pinocchio_ik
+Scripts: lib/openarm_pinocchio_ik/
+  - fk
+  - home
+  - ik_node
+  - move_joints
+
+RUNTIME STATUS: BLOCKED
+------------------------
+FK/IK tests CANNOT RUN due to NumPy incompatibility.
+
+ERROR:
+  Pinocchio compiled with NumPy 1.x is incompatible with NumPy 2.2.6
+  ImportError: AttributeError: _ARRAY_API not found
+  Segmentation fault when importing pinocchio
+
+IMPACT:
+  - fk CLI: BLOCKED
+  - ik_node: BLOCKED
+  - test_fk_ik.py: BLOCKED
+  - move_joints/home: BLOCKED (require pinocchio indirectly via kinematics)
+
+WHAT WORKS:
+  - Static analysis: COMPLETE
+  - Python syntax check: PASSED
+  - colcon build: PASSED
+  - Console script installation: PASSED
+
+NO RUNTIME TESTS PERFORMED
+---------------------------
+The following tests were NOT executed due to NumPy/Pinocchio incompatibility:
+1. FK CLI with test angles (right: 0,-30,0,90,0,45,0)
+2. FK CLI with test angles (left: 0,0,0,0,0,0,0)
+3. FK->IK->FK validation via test_fk_ik.py
+4. Output accuracy checks (position <= 1mm, orientation <= 0.1deg)
+
+REQUIRED FOR RUNTIME TESTS:
+---------------------------
+EITHER:
+  1. Downgrade NumPy to < 2.0
+  2. Rebuild Pinocchio with NumPy 2.0+ support
+
+NO MODIFICATIONS MADE TO SOURCE
+-------------------------------
+As per requirements, no code was modified to fix this dependency issue.

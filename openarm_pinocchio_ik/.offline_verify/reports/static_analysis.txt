@@ -1,0 +1,131 @@
+STATIC ANALYSIS REPORT
+======================
+
+PACKAGE METADATA
+----------------
+Name: openarm_pinocchio_ik
+Version: 0.1.0
+License: Apache License 2.0
+Maintainer: openarm@enactic.ai
+Description: Pinocchio-based FK/IK + gravity compensation ROS2 node for OpenArm
+Build Type: ament_python
+
+CONSOLE_SCRIPTS (setup.py)
+--------------------------
+1. ik_node = openarm_pinocchio_ik.ik_node:main
+2. fk = openarm_pinocchio_ik.fk:main
+3. move_joints = openarm_pinocchio_ik.move_joints:main
+4. home = openarm_pinocchio_ik.home:main
+
+NOTE: No 'validate_fk_ik' entry point (must run test_fk_ik.py directly)
+
+MODULE STRUCTURE
+----------------
+kinematics.py  - Core PinocchioModel class (FK, IK, gravity)
+fk.py          - Forward kinematics CLI
+ik_node.py     - ROS2 IK node (subscribes pose, publishes trajectory + effort)
+move_joints.py - Joint-space move CLI (publishes JointTrajectory)
+home.py        - Home command (zero pose shortcut for move_joints)
+test_fk_ik.py  - Offline validation script (FK->IK->FK round-trip)
+
+JOINT NAMES (from kinematics.py)
+---------------------------------
+Left arm:  openarm_left_joint1..openarm_left_joint7
+Right arm: openarm_right_joint1..openarm_right_joint7
+
+TCP FRAMES (from kinematics.py)
+-------------------------------
+Left:  openarm_left_hand_tcp
+Right: openarm_right_hand_tcp
+
+BASE/ROOT FRAME (from URDF)
+---------------------------
+world
+
+IK_NODE PARAMS (from ik_node.py)
+---------------------------------
+side: "right" (default)
+urdf_path: /ros2_ws/install/openarm_description/.../v1.urdf (hardcoded)
+control_hz: 50.0
+ik_max_iters: 50
+ik_tol: 1e-4
+ik_damping: 1e-2
+max_step_rad: 0.05 (rate-limit for safety on real hardware)
+enable_gravity_comp: True
+
+IK_NODE TOPICS (from ik_node.py)
+----------------------------------
+Subscribes:
+  /openarm_{side}_target_pose (PoseStamped) - target EE pose
+  /joint_states (JointState) - current joint positions for warm-start
+
+Publishes:
+  /{side}_joint_trajectory_controller/joint_trajectory (JointTrajectory)
+  /{side}_forward_effort_controller/commands (Float64MultiArray)
+
+MOVE_JOINTS BEHAVIOR (from move_joints.py)
+-------------------------------------------
+- Reads current /joint_states
+- Builds interpolated trajectory from current to target
+- Publishes to /{side}_joint_trajectory_controller/joint_trajectory
+- Requires running bimanual launch (reads /joint_states)
+- NO dry-run mode
+
+HOME BEHAVIOR (from home.py)
+----------------------------
+- Shortcut for move_joints with target=zeros(7)
+- Same dependencies and behavior as move_joints
+
+FK CLI BEHAVIOR (from fk.py)
+----------------------------
+- Pure offline computation, no ROS node
+- Reads no topics, publishes nothing
+- Input: 7 joint angles
+- Output: EE position and orientation (xyzw quaternion)
+- SAFE for offline validation
+
+URDF PATH ISSUE
+---------------
+Hardcoded paths in fk.py, ik_node.py, test_fk_ik.py:
+  /ros2_ws/install/openarm_description/share/openarm_description/...
+
+Actual URDF location in source tree:
+  /ros2_ws/openarm_ros2/openarm_description/assets/robot/openarm_v1.0/urdf/example/v1.urdf
+
+ISSUE: Default paths point to install directory, not source tree.
+         Users must override --urdf parameter when running from source.
+
+NO OLD SERVER PATHS
+-------------------
+No 192.168.x.x references found
+No enactic.ai external server references found in src/
+
+GRIPPER/FINGER JOINTS
+--------------------
+URDF uses mimic joints (finger_joint2 follows finger_joint1)
+PinocchioModel initialized with mimic=True
+
+QUATERNION CONVENTION
+---------------------
+ROS/geometry_msgs convention: [x, y, z, w] (xyzw)
+
+IK ALGORITHM
+------------
+Damped Least Squares (DLS)
+- No built-in Pinocchio IK solver
+- Custom implementation in PinocchioModel.ik()
+- Returns None if not converged
+- Joint limits enforced via np.clip()
+
+SAFETY NOTES
+------------
+1. ik_node: max_step_rad=0.05 rate-limits commanded joint steps
+2. ik_node: IK failure triggers warning, does not publish
+3. move_joints/home: NO dry-run mode - will command real hardware
+4. No input validation on target pose ranges
+
+STATIC CHECKS PASSED
+--------------------
+- Python syntax: OK (compileall succeeded)
+- No missing imports in source
+- ROS message types available (geometry_msgs, sensor_msgs, trajectory_msgs)

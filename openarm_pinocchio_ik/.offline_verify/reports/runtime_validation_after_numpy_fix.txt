@@ -1,0 +1,80 @@
+RUNTIME VALIDATION AFTER NUMPY FIX
+===================================
+
+Date: 2026-07-24
+Resolution: Isolated venv with NumPy 1.26.4
+
+ENVIRONMENT CONFIGURATION
+-------------------------
+Venv Location: /ros2_ws/openarm_pinocchio_ik/.offline_verify/venv
+NumPy Version: 1.26.4 (installed in venv)
+NumPy Location: /ros2_ws/openarm_pinocchio_ik/.offline_verify/venv/lib/python3.10/site-packages/numpy/
+Pinocchio Version: 3.9.0
+Pinocchio Location: /opt/ros/humble/lib/python3.10/site-packages/pinocchio/
+rclpy: OK
+ROS Messages: OK
+
+URDF Used
+---------
+Source: /ros2_ws/openarm_ros2/openarm_description/assets/robot/openarm_v1.0/urdf/example/v1.urdf
+Note: Overrode hardcoded path from source code
+
+TEST RESULTS
+------------
+
+1. FK CLI Help: PASS
+   - Command: python -m openarm_pinocchio_ik.fk --help
+   - Output: All parameters displayed correctly
+
+2. Right Arm FK Test: PASS
+   - Input: 0,-30,0,90,0,45,0 (degrees)
+   - Output:
+     * joints (rad): [0.0, -0.5236, 0.0, 1.5708, 0.0, 0.7854, 0.0]
+     * EE position xyz: [0.2160, -0.0435, 0.5075]
+     * EE orientation xyzw: [0.5610, 0.0923, 0.7011, -0.4305]
+
+3. Left Arm FK Test: PASS
+   - Input: 0,0,0,0,0,0,0 (degrees)
+   - Output:
+     * joints (rad): [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+     * EE position xyz: [0.0000, 0.1535, 0.2620]
+     * EE orientation xyzw: [1.0000, 0.0000, 0.0000, 0.0000]
+
+4. FK→IK→FK Round-Trip Validation: PASS
+   - Convergence: 12/20 (60%)
+   - Max Position Error: 0.090 mm (target ≤ 1mm) ✓
+   - Max Orientation Error: 0.005 deg (target ≤ 0.1deg) ✓
+   - Result: PASS
+
+Joint Limits (Right Arm)
+------------------------
+Index: [8, 9, 10, 11, 12, 13, 14]
+Lower (rad): [-1.396, -0.175, -1.571, 0.0, -1.571, -0.785, -1.571]
+Upper (rad): [3.491, 3.316, 1.571, 2.443, 1.571, 0.785, 1.571]
+
+Gravity Compensation (Home Position)
+------------------------------------
+Torques (Nm): [1.671, 3.974, 1.694, 1.145, -0.025, -0.154, 0.116]
+
+HIGH-RISK COMMANDS NOT EXECUTED
+-------------------------------
+- move_joints: NOT RUN
+- home: NOT RUN
+- ik_node: NOT RUN
+- openarm_bringup: NOT RUN
+- controller_manager: NOT RUN
+- No trajectory commands published
+- No effort commands published
+- No CAN operations
+
+EXIT CODES
+----------
+FK Help: 0
+Right Arm FK: 0
+Left Arm FK: 0
+FK→IK→FK: 0
+
+CONCLUSION
+----------
+Runtime validation PASSED after resolving NumPy/Pinocchio compatibility
+via isolated virtual environment.
