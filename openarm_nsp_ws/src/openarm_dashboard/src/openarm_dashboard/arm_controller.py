@@ -112,6 +112,15 @@ class ArmController:
         # sim state
         self._sim_pos = np.zeros(ARM_DOF)
         self._sim_tmos = np.full(ARM_DOF, 34.0)
+        # gravity compensation (KDL-equivalent G(q) feedforward; off until enabled)
+        self.gravity_on = False
+        self.grav_scale = 0.0
+        self._grav = None
+        try:
+            from .gravity import GravityComp
+            self._grav = GravityComp()
+        except Exception as e:  # noqa: BLE001
+            print(f"{self.side}: gravity model unavailable: {type(e).__name__}: {e}", flush=True)
         if not sim:
             if not _HAVE_CAN:
                 raise RuntimeError("openarm_can not available; use sim=True")
@@ -283,6 +292,7 @@ class ArmController:
         self.enabled = True
 
     def _disable(self) -> None:
+        self.gravity_on = False
         if self.sim:
             self.enabled = False
             return
@@ -297,6 +307,27 @@ class ArmController:
             return self._sim_pos.copy()
         motors = self.oa.get_arm().get_motors()
         return np.array([m.get_position() for m in motors[:ARM_DOF]])
+
+    # ------------------------------------------------- gravity
+    def _grav_tau(self) -> np.ndarray:
+        """Gravity feedforward (7-vec) added to the MIT tau. Zeros if off/disabled."""
+        if (not self.enabled or not self.gravity_on or self.grav_scale <= 0
+                or self._grav is None):
+            return np.zeros(ARM_DOF)
+        try:
+            return self._grav.torque(self.side, self._read_pos(), self.grav_scale)
+        except Exception:  # noqa: BLE001
+            return np.zeros(ARM_DOF)
+
+    def set_gravity(self, on: bool, scale: float) -> None:
+        """Toggle gravity comp + set scale (0..1.5). Effective only when enabled."""
+        self.gravity_on = bool(on) and self.enabled
+        try:
+            self.grav_scale = float(max(0.0, min(1.5, scale)))
+        except (TypeError, ValueError):
+            pass
+        self.rs.log(f"{self.side}: 重力补偿 {'ON' if self.gravity_on else 'OFF'} "
+                    f"scale={self.grav_scale:.2f}")
 
     # ------------------------------------------------- step
     def _step(self) -> None:
@@ -330,7 +361,9 @@ class ArmController:
             return
         if self.mode == ArmMode.ZERO_TORQUE:
             if not self.sim:
-                self.oa.get_arm().mit_control_all([MITParam(0, 0, 0, 0, 0)] * ARM_DOF)
+                g = self._grav_tau()
+                self.oa.get_arm().mit_control_all(
+                    [MITParam(0, 0, 0, 0, g[i]) for i in range(ARM_DOF)])
         elif self.mode == ArmMode.ENABLED_HOLD:
             if self.sim:
                 self._sim_pos += 0.1 * (self._hold_q - self._sim_pos)
@@ -342,7 +375,8 @@ class ArmController:
             self._step_track()
 
     def _mit_hold(self, target: np.ndarray) -> None:
-        params = [MITParam(ARM_KP[i], ARM_KD[i], target[i], 0, 0) for i in range(ARM_DOF)]
+        g = self._grav_tau()
+        params = [MITParam(ARM_KP[i], ARM_KD[i], target[i], 0, g[i]) for i in range(ARM_DOF)]
         self.oa.get_arm().mit_control_all(params)
 
     def _step_move(self) -> None:
@@ -389,11 +423,22 @@ class ArmController:
             self._mit_hold(target)
 
     def tracking_q(self) -> tuple[np.ndarray, np.ndarray] | None:
-        """Latest (planned_q, actual_q) during a moving mode (HOMING / GO_* /
-        TRACKING), or None when idle. The UI FKs both to show tracking error."""
-        if self.mode in _BUSY and self._last_planned_q is not None and self._last_actual_q is not None:
-            return self._last_planned_q, self._last_actual_q
-        return None
+        """(planned_q, actual_q) for the IK tracking-error display.
+        During motion (HOMING/GO_*/TRACKING): the interpolated target. While
+        holding (ENABLED_HOLD): the held target — so the display KEEPS showing
+        the STEADY-STATE error after motion stops (doesn't drain). None only
+        when disabled / idle (zero-torque)."""
+        if not self.enabled or self._last_actual_q is None:
+            return None
+        if self.mode in _BUSY:
+            planned = self._last_planned_q
+        elif self.mode == ArmMode.ENABLED_HOLD:
+            planned = self._hold_q
+        else:
+            return None
+        if planned is None:
+            return None
+        return planned, self._last_actual_q
 
     # ------------------------------------------------- sim
     def _sim_sense(self):

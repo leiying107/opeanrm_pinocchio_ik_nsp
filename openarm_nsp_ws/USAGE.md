@@ -2,7 +2,7 @@
 
 > 路径：`/ros2_ws/openarm_nsp_ws/`
 > 目标机器人：OpenArm v1.0（7-DoF × 2 双臂，达妙电机，CAN-FD）
-> 最后更新：2026-08-11
+> 最后更新：2026-08-14（新增 web_panel / 重力补偿 / IK 跟踪误差方向显示）
 
 ---
 
@@ -12,7 +12,7 @@
 
 1. **零空间投影逆运动学（NSP-IK）** —— 双阶段求解：DLS 收敛 + σ_min/关节裕度爬升，主动远离奇异与限位。
 2. **离线轨迹规划** —— 笛卡尔直线 / SE(3) 弧线拟合 / B 样条优化（含自碰撞避免）。
-3. **实机控制 Dashboard** —— Dash Web 界面（:8050），CAN 直驱、状态机、示教-复现、实时关节曲线。
+3. **实机控制面板** —— 新一代 `web_panel`（FastAPI + SSE + canvas，丝滑，:8050）：CAN 直驱、状态机、示教-复现、实时关节/误差曲线、**重力补偿前馈**、**IK 跟踪误差方向显示**。旧 Dash 版 `hardware_dashboard` 保留作 fallback（见 §5、§13）。
 
 两个 ROS2 包：
 
@@ -43,9 +43,12 @@ openarm_nsp_ws/
     │   └── validation/                # 离线验证脚本（见 §8）
     └── openarm_dashboard/
         └── src/openarm_dashboard/
-            ├── hardware_dashboard.py  # Dash :8050 主界面
-            ├── arm_controller.py      # 每臂状态机 + 250Hz 工作线程（CAN 直驱）
-            └── robot_state.py         # 线程安全状态容器 + 滚动绘图缓冲
+            ├── hardware_dashboard.py  # 旧版 Dash 面板（fallback）
+            ├── web_panel.py           # ★ 新一代面板：FastAPI + SSE + canvas（§13）
+            ├── gravity.py             # ★ 重力补偿 G(q)（pinocchio on v1_simple.urdf，§14）
+            ├── arm_controller.py      # 每臂状态机 + 250Hz 工作线程（CAN 直驱 + 重力前馈）
+            ├── robot_state.py         # 线程安全状态容器 + 滚动绘图缓冲
+            └── static/index.html      # ★ web_panel 前端（原生 JS + canvas）
 ```
 
 ---
@@ -95,8 +98,9 @@ source install/setup.bash
 | `can_slot1_ch0` | LEFT |
 | `can_slot1_ch1` | RIGHT |
 
-Dashboard 启动时会自动 `ip link set ... up`（需 root）。CAN 映射的单一事实源在
-`hardware_dashboard.py` 的 `CAN_MAP`，硬件换槽时改这里。
+`hardware_dashboard` / `web_panel` 启动时会自动 `ip link set ... up`（需 root）。CAN 映射
+在两者的 `CAN_MAP`（slot1: ch0=左 / ch1=右）；`web_panel` 还支持 `--can-slot N` 命令行覆盖
+（默认 1），硬件换槽时直接传参即可，不用改代码。
 
 > ⚠️ **`openarm.bimanual.launch.py` 的默认 left/right 是反的**（默认 right=ch0/left=ch1）。
 > 如果你同时跑 ros2_control，必须显式传 `left_can_interface:=can_slot1_ch0 right_can_interface:=can_slot1_ch1`。
@@ -185,6 +189,17 @@ ros2 run openarm_dashboard hardware_dashboard --sim  # 仿真（无硬件，自�
 ```
 
 浏览器打开 `http://<IP>:8050`。启动后**双臂自动进入零力矩**（安全默认，可拖动）。
+
+> ★ **推荐用新一代 `web_panel`**（FastAPI + SSE + canvas，比 Dash 版丝滑得多，含重力补偿 + 误差方向显示）：
+> ```bash
+> source /opt/ros/humble/setup.bash
+> source /ros2_ws/openarm_ros2/install/setup.bash    # 提供 URDF (openarm_description)
+> source /ros2_ws/openarm_nsp_ws/install/setup.bash
+> ros2 run openarm_dashboard web_panel               # 实机，默认 slot1:8050
+> ros2 run openarm_dashboard web_panel --sim         # 仿真
+> ros2 run openarm_dashboard web_panel --can-slot 1 --port 8050   # 显式
+> ```
+> 详见 §13（架构/接口）、§14（重力补偿）、§15（跟踪误差方向）。上面的 `hardware_dashboard` 是旧 Dash 版，保留作 fallback。
 
 ### 5.2 状态机
 
@@ -473,3 +488,120 @@ ros2 run openarm_dashboard hardware_dashboard
 ```
 
 > 首次测试建议起点/终点间距 ≤ 5cm，确认无异常后再放大行程。
+
+---
+
+## 13. 新一代面板 `web_panel`（FastAPI + SSE + canvas）★ 新增
+
+### 13.1 为什么重做
+旧 Dash 面板（`hardware_dashboard`）卡顿根因：每个 `dcc.Interval` tick = 浏览器 POST → 后端跑 Python → **序列化整张 Plotly 图** → 回传 → React 重渲染。2–5Hz 即卡，关节图每 tick 重排最重。
+
+新 `web_panel` 借鉴 `openarm_panel` 的架构，**服务端推 + 原生渲染**：
+
+| | 旧 Dash | 新 web_panel |
+|---|---|---|
+| 状态通道 | `dcc.Interval` HTTP POST 轮询（每 tick 一次往返） | **SSE 持久推流** ~20Hz（单向，无往返） |
+| 每帧负载 | 整张 Plotly figure 序列化 | 极小 JSON（关节角 + 位姿 + 误差） |
+| 渲染 | Plotly（React 协调 + SVG/WebGL 重绘） | **`<canvas>` 直接画**（微秒级） |
+| 指令 | Dash callback（又是 HTTP 往返 + 重渲染） | REST POST（独立，一次性） |
+
+### 13.2 后端完全复用
+与 `hardware_dashboard` **同一套后端**（`ArmController` 状态机 + CAN 直驱 + NSP-IK/规划），只换了 UI 传输层。**所有功能保留**：使能/抱住/归零/失能、示教起终点、直线/弧线/关节回放/B样条、弧线限速、双 IK 模式（快速/精细）。新增：重力补偿（§14）、跟踪误差方向显示（§15）。
+
+### 13.3 启动
+```bash
+source /opt/ros/humble/setup.bash
+source /ros2_ws/openarm_ros2/install/setup.bash    # URDF (openarm_description)
+source /ros2_ws/openarm_nsp_ws/install/setup.bash  # openarm_dashboard + openarm_pinocchio_nsp
+ros2 run openarm_dashboard web_panel               # 实机，默认 slot1:8050
+ros2 run openarm_dashboard web_panel --sim         # 仿真（无硬件）
+ros2 run openarm_dashboard web_panel --can-slot 1 --port 8050   # 显式
+```
+浏览器 `http://<IP>:8050`。启动后双臂零力矩（安全默认）。`Ctrl-C` 退出（自动失能双臂）。
+参数：`--sim` / `--port` / `--host` / `--no-can`（跳过自动 bringup）/ `--can-slot`（默认 1，ch0=左/ch1=右）。
+
+### 13.4 通信接口（HTTP）
+- `GET /sse/stream` —— `text/event-stream`，~20Hz 推 JSON 快照：
+  `{arms:{left,right:{mode,enabled,tmos_max,taught[2],arc_n,progress,can_up,joints[7],err{pos[3],ori[3],pmag,omag}|null,grav_on,grav_scale}}, log[...], tune{...}}`
+  浏览器用 `EventSource` 接收，`<canvas>` 画关节图/误差图，断线指数退避重连。
+- `GET /state` —— 单次快照（首屏初始化）。
+- `POST /mode {side,action}` —— action ∈ enable|hold|home|disable
+- `POST /teach {side,which}` —— which ∈ start|end
+- `POST /action {side,op}` —— op ∈ go_start|go_end|line_run|arc_add|arc_clear|arc_start|arc_run|replay_run|bspline_run
+- `POST /tune {slowdown,cap,mode,maxspeed,freq}` —— 实时调参（弧线限速/双IK模式/回放速度频率）
+- `POST /gravity {side,on,scale}` —— 重力补偿开关 + scale（§14）
+
+### 13.5 文件
+- `web_panel.py` —— FastAPI + uvicorn 后端（SSE + REST），复用 ArmController/RobotState/规划器。
+- `static/index.html` —— 单文件原生 JS 前端（EventSource + canvas + fetch）。
+- `gravity.py` —— 重力补偿（§14）。
+- 入口 `web_panel`（旧入口 `hardware_dashboard` 仍在，作 fallback）。
+
+---
+
+## 14. 重力补偿（前馈 G(q)）★ 新增
+
+### 14.1 作用
+给 MIT 力矩前馈 `τ_ff = scale·G(q)`，抵消 PD 的稳态重力下垂（sag = G(q)/kp）。**开启后抬起臂到任意位姿可保持住**（纯前馈 hold，不掉）。开着重补照样能做 IK/直线/弧线/回放（所有使能态都叠加 τ_ff）。
+
+### 14.2 算法（与 openarm_simple_hardware.cpp 的 KDL 路径等价）
+- 在 `v1_simple.urdf`（19 质量块简化模型）上算 `G(q)`，用 **pinocchio `computeGeneralizedGravity`**。数值与 KDL `ChainDynParam::JntToGravity`、MuJoCo `qfrc_bias` **完全一致**（三者都是同一套刚体重力项）。
+- **motor_q 直接用**（`v1_simple.urdf` 关节零位已对齐电机编码器，**无需 motor→URDF 偏置**——FK 验证：v1_simple.urdf FK(motor_q) == example/v1.urdf FK(motor_q)）。⚠️ **不要再加偏置**：曾照搬 cpp 的 `OPENARM_GRAVITY_OFFSETS` 导致肘部翘起（G(q) 算在了错误的肘部角度）。cpp 的偏置是给另一个 URDF（带 hand_tcp 的 openarm_v10.urdf）用的。
+- 按各电机 TMAX `[54,54,28,28,10,10,10]`（DM8009/DM4340/DM4310 Nm）钳位，防错模型冲扭矩。
+- 重力向量 (0,0,−9.81)。
+- 应用为 `+G(q)`（与 cpp `tau += G_KDL` 一致）。
+
+### 14.3 用法（UI）
+每臂一个「重力补偿」复选框（**仅使能后可点**）+ scale 滑条 0–1.0（**默认 0=关**）。
+1. 使能某臂（零力矩）。
+2. 勾「重力补偿」。
+3. **滑条从 0 慢慢推到 ~0.8–1.0**。抬起臂，它应停在原位（不掉）。
+   - 臂仍下垂 → scale 偏低，升高。
+   - 抖动/超调 → scale 偏高，降低。
+   - 失能自动关重力补偿。
+
+### 14.4 URDF 解析顺序
+`$OPENARM_GRAVITY_URDF` → `/tmp/v1_simple.urdf` → 包内置 `v1_simple.urdf`（三级回退）。
+
+### 14.5 文件 / API
+- `gravity.py::GravityComp.torque(side, motor_q, scale)` → 7 向量（已 clamp）。
+- `arm_controller.py::_grav_tau()`（每控制周期算并注入 MIT tau）/ `set_gravity(on, scale)`（UI 调）。
+- pinocchio 计算 G(q) ~µs 级，250Hz × 2 臀开销可忽略。
+
+---
+
+## 15. IK 跟踪误差显示（保持稳态 + 方向）★ 新增
+
+误差图（每臂）显示「**规划末端位姿 vs 实际末端位姿**」的偏差随时间（FK(目标关节角) vs FK(实测关节角)）。
+
+### 15.1 运动后保持稳态
+`tracking_q()` 在运动（HOMING/GO_*/TRACKING）**和抱住（HOLD）**态都返回（目标, 实测），所以**运动停止后误差图不清空**，持续显示稳态残差（停在终态时的平线）。
+
+### 15.2 显示方向（按轴分解）
+误差图下方读数框：
+```
+位置 6.2mm  (前-3.8 左+4.8 上+0.0) → 偏左 4.8mm
+姿态 0.21°  (R+0.18 P+0.10 Y+0.03) → 滚R 0.18°
+```
+- 位置 `d = 实际 − 目标`（mm），body 系：**x 前 / y 左 / z 上**。
+  「偏下」(dz<0) = 臂低于目标（即重力下垂 sag）。
+- 姿态 R/P/Y（°），实际相对规划。
+- 主导方向（最大分量）自动标注。
+
+### 15.3 用途
+- **开着重力补偿**：稳态位置/姿态误差趋近 0（方向随机小噪声）。
+- **关掉重力补偿**：会看到明显的「偏下」（dz<0），可**量化重力补偿效果**（误差图的稳态平线 + 读数框的方向/数值）。
+- 误差图 Y 轴自适应（左 mm / 右 °，独立双轴）；X 轴时间（最近 ~8s）。
+
+---
+
+## 16. 文件清单（openarm_dashboard 包）
+
+| 文件 | 作用 |
+|------|------|
+| `web_panel.py` | ★ 新一代面板：FastAPI + SSE + canvas 后端（推荐） |
+| `static/index.html` | ★ web_panel 前端（原生 JS + canvas） |
+| `gravity.py` | ★ 重力补偿 G(q)（pinocchio on v1_simple.urdf） |
+| `hardware_dashboard.py` | 旧版 Dash 面板（fallback） |
+| `arm_controller.py` | 每臂状态机 + 250Hz CAN 工作线程 + 重力前馈注入 |
+| `robot_state.py` | 线程安全状态容器 + 滚动绘图缓冲 |

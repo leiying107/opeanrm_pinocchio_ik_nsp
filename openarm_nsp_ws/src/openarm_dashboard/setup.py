@@ -8,6 +8,8 @@ setup(
     version='0.1.0',
     packages=[package_name],
     package_dir={'': 'src'},
+    package_data={package_name: ['static/*', 'v1_simple.urdf']},
+    include_package_data=True,
     data_files=[
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
@@ -26,6 +28,7 @@ setup(
         'console_scripts': [
             'hardware_dashboard = openarm_dashboard.hardware_dashboard:main',
             'ik_dashboard = openarm_dashboard.ik_dashboard:main',
+            'web_panel = openarm_dashboard.web_panel:main',
         ],
     },
 )

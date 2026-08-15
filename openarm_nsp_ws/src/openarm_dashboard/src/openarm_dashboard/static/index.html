@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>OpenArm Hardware Panel</title>
+<style>
+  :root{--bg:#0f1115;--card:#171a21;--line:#262b35;--tx:#e6e9ef;--mut:#8a93a3;
+        --grn:#43a047;--blu:#1e88e5;--org:#fb8c00;--red:#e53935;--pur:#8e24aa;
+        --cyn:#00acc1;--pnk:#d81b60;--brn:#6d4c41;--gry:#546e7a;--teal:#00897b;--ind:#3949ab;}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.4 -apple-system,Roboto,system-ui,sans-serif}
+  header{padding:10px 14px;border-bottom:1px solid var(--line);display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+  header h2{margin:0;font-size:17px}
+  .pill{font-size:12px;padding:3px 8px;border-radius:10px;background:#1f2630;color:var(--mut)}
+  .pill.stale{background:#3a1f1f;color:#ff9a9a}
+  #canbar{color:var(--mut);font-size:13px}
+  .tune{display:flex;gap:14px;align-items:center;flex-wrap:wrap;padding:8px 14px;background:#131a26;border-bottom:1px solid var(--line);font-size:13px}
+  .tune label{color:var(--mut);font-size:12px;margin-right:4px}
+  .tune input{width:56px;background:#0d1117;color:var(--tx);border:1px solid var(--line);border-radius:4px;padding:3px 6px}
+  .tune .seg{display:inline-flex;gap:6px}
+  .row{display:flex;gap:18px;flex-wrap:wrap;padding:14px}
+  .arm{flex:1 1 430px;min-width:430px;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px}
+  .arm h3{margin:0 0 6px;font-size:15px}
+  .stat{display:flex;gap:14px;align-items:center;font-size:13px;margin-bottom:4px}
+  .stat .mode{font-weight:600}
+  .progress{height:7px;background:#222a36;border-radius:4px;overflow:hidden;margin:6px 0 8px}
+  .progress>i{display:block;height:100%;width:0;background:linear-gradient(90deg,#1e88e5,#00acc1)}
+  canvas{display:block;width:100%;background:#0c0f14;border:1px solid var(--line);border-radius:6px}
+  .ctitle{color:var(--mut);font-size:12px;margin:8px 0 3px}
+  .btns{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+  .btns .grp{display:flex;flex-wrap:wrap;gap:6px;padding-bottom:6px;border-bottom:1px dashed var(--line);width:100%}
+  .btns .grp:last-child{border-bottom:0}
+  button{border:0;border-radius:6px;color:#fff;padding:8px 11px;font-size:13px;cursor:pointer;opacity:.92}
+  button:hover{filter:brightness(1.08)}
+  button:disabled{opacity:.32;cursor:not-allowed}
+  .log{margin:0 14px 14px;background:#0c0f14;border:1px solid var(--line);border-radius:8px;padding:8px 10px;
+       height:140px;overflow:auto;font:11px/1.45 ui-monospace,monospace;color:#9fb0c7;white-space:pre-wrap}
+  .b-enable{background:var(--grn)}.b-hold{background:var(--blu)}.b-home{background:var(--org)}.b-disable{background:var(--red)}
+  .b-record_start{background:var(--pur)}.b-record_end{background:var(--pur)}
+  .b-go_start{background:var(--cyn)}.b-go_end{background:var(--pnk)}.b-line_run{background:#e85a2c}
+  .b-arc_add{background:var(--brn)}.b-arc_clear{background:var(--gry)}
+  .b-arc_start{background:var(--cyn)}.b-arc_run{background:var(--pur)}.b-replay_run{background:var(--teal)}.b-bspline_run{background:var(--ind)}
+  .grav{display:flex;align-items:center;gap:8px;margin:4px 0 2px;font-size:13px}
+  .grav input[type=checkbox]{width:16px;height:16px}
+  .grav input[type=range]{width:130px;accent-color:#ffb74d}
+  .mut{color:var(--mut);font-variant-numeric:tabular-nums;min-width:28px}
+  .errtxt{font:11px/1.45 ui-monospace,monospace;color:#cfe3ff;background:#0c0f14;border:1px solid var(--line);
+          border-radius:5px;padding:5px 7px;margin:4px 0 6px;white-space:pre-wrap;min-height:30px}
+</style>
+</head>
+<body>
+<header>
+  <h2>OpenArm Hardware Panel</h2>
+  <span class="pill" id="livepill">live: connecting…</span>
+  <span id="canbar"></span>
+</header>
+
+<div class="tune">
+  <span style="color:var(--mut)">弧线限速</span>
+  <label>放慢倍数</label><input id="t-slowdown" type="number" step="0.5" min="0.5"/>
+  <label>限幅 rad/s</label><input id="t-cap" type="number" step="0.1" min="0.1"/>
+  <span class="seg">
+    <label><input type="radio" name="mode" value="fast">快速</label>
+    <label><input type="radio" name="mode" value="thorough">精细</label>
+  </span>
+  <span style="color:var(--teal)">｜关节回放</span>
+  <label>最大角速度 rad/s</label><input id="t-maxspeed" type="number" step="0.1" min="0.1"/>
+  <label>频率 Hz</label><input id="t-freq" type="number" step="10" min="10" max="250"/>
+</div>
+
+<div class="row" id="arms"></div>
+<div class="log" id="log"></div>
+
+<script>
+const SIDES=["left","right"];
+const MODE=["enable","hold","home","disable"];
+const TEACH=["record_start","record_end","go_start","go_end","line_run"];
+const ARC=["arc_add","arc_clear","arc_start","arc_run","replay_run","bspline_run"];
+const L={enable:"使能(零力矩)",hold:"抱住",home:"归零⚠",disable:"失能",
+  record_start:"📍记录起点",record_end:"📍记录终点",go_start:"↩回起点",go_end:"▶到终点",line_run:"▶直线运动",
+  arc_add:"📍弧线加点",arc_clear:"🗑清空",arc_start:"↩弧线回起点",arc_run:"▶弧线IK",replay_run:"▶关节回放",bspline_run:"▶B样条"};
+const BUSY=new Set(["HOMING","GO_START","GO_END","TRACKING"]);
+const HIST=160;
+const jointHist={left:[],right:[]}, errHist={left:[],right:[]};
+let lastLog="";
+
+// ---- build arm cards ----
+const armsEl=document.getElementById("arms");
+for(const s of SIDES){
+  const card=document.createElement("div"); card.className="arm"; card.innerHTML=`
+    <h3>${s==="left"?"左":"右"}臂 (${s})</h3>
+    <div class="stat"><span class="mode" id="mode-${s}">—</span><span id="tmp-${s}">—</span>
+      <span style="color:var(--mut)" id="taught-${s}"></span></div>
+    <div class="progress"><i id="prog-${s}"></i></div>
+    <div class="grav"><label><input type="checkbox" id="gv-${s}"> 重力补偿</label>
+      <input type="range" id="gs-${s}" min="0" max="1" step="0.05" value="0">
+      <span class="mut" id="gl-${s}">0.00</span></div>
+    <div class="ctitle">关节位置 (rad, 最近${(HIST/20).toFixed(0)}s)</div>
+    <canvas id="cj-${s}" height="150"></canvas>
+    <div class="ctitle">IK 跟踪误差 (mm / °) — 运动后保持稳态</div>
+    <canvas id="ce-${s}" height="110"></canvas>
+    <pre class="errtxt" id="errtxt-${s}">（使能 + 抱住/运动 后显示稳态误差与方向）</pre>
+    <div class="btns" id="btns-${s}"></div>`;
+  armsEl.appendChild(card);
+  const bb=document.getElementById("btns-"+s);
+  const mk=(b)=>{const e=document.createElement("button");e.textContent=L[b];e.className="b-"+b;e.dataset.b=b;return e;};
+  const g1=document.createElement("div");g1.className="grp";MODE.forEach(b=>g1.appendChild(mk(b)));
+  const g2=document.createElement("div");g2.className="grp";TEACH.forEach(b=>g2.appendChild(mk(b)));
+  const g3=document.createElement("div");g3.className="grp";ARC.forEach(b=>g3.appendChild(mk(b)));
+  bb.appendChild(g1);bb.appendChild(g2);bb.appendChild(g3);
+  bb.addEventListener("click",(ev)=>onClick(s,ev.target));
+}
+
+// ---- canvas helpers ----
+function fit(c){const dpr=window.devicePixelRatio||1;const w=c.clientWidth,h=c.clientHeight;
+  if(c.width!==w*dpr||c.height!==h*dpr){c.width=w*dpr;c.height=h*dpr;}return dpr;}
+const PCOL=["#e57373","#fdd835","#81c784","#4dd0e1","#64b5f6","#ba68c8","#ffb74d"];
+const AXF=11;
+function xLab(ctx,dpr,L,R,B){ // time ticks: 0 (now, right) … -8s (left)
+  ctx.textAlign="center";ctx.textBaseline="top";ctx.fillStyle="#7f8aa0";
+  const win=HIST/20;for(let sec=0;sec<=win+1e-9;sec+=2){const px=R-(sec/win)*(R-L);ctx.fillText(sec===0?"0":String(-sec),px,B+3*dpr);}
+}
+function drawJoints(s){
+  const c=document.getElementById("cj-"+s),ctx=c.getContext("2d"),dpr=fit(c);
+  const W=c.width,H=c.height;ctx.clearRect(0,0,W,H);
+  const L=34*dpr,R=W-10*dpr,T=6*dpr,B=H-18*dpr;
+  const YL=-3.5,YU=3.5,yof=v=>T+(1-(v-YL)/(YU-YL))*(B-T);
+  ctx.font=(AXF*dpr)+"px ui-monospace,monospace";ctx.lineWidth=dpr;
+  ctx.textAlign="right";ctx.textBaseline="middle";
+  for(const v of [-3,-2,-1,0,1,2,3]){const py=yof(v);
+    ctx.strokeStyle= v===0?"#2a3344":"#1b2230";ctx.beginPath();ctx.moveTo(L,py);ctx.lineTo(R,py);ctx.stroke();
+    ctx.fillStyle="#7f8aa0";ctx.fillText(String(v),L-4*dpr,py);}
+  xLab(ctx,dpr,L,R,B);
+  const hist=jointHist[s];if(hist.length<2)return;
+  const xof=i=>L+((i+(HIST-hist.length))/(HIST-1))*(R-L);ctx.lineWidth=dpr*1.4;
+  for(let j=0;j<7;j++){ctx.beginPath();ctx.strokeStyle=PCOL[j];
+    for(let i=0;i<hist.length;i++){const px=xof(i),py=yof(hist[i][j]);i?ctx.lineTo(px,py):ctx.moveTo(px,py);}ctx.stroke();}
+}
+function drawErr(s){
+  const c=document.getElementById("ce-"+s),ctx=c.getContext("2d"),dpr=fit(c);
+  const W=c.width,H=c.height;ctx.clearRect(0,0,W,H);
+  const L=34*dpr,R=W-34*dpr,T=6*dpr,B=H-18*dpr;
+  ctx.font=(AXF*dpr)+"px ui-monospace,monospace";ctx.lineWidth=dpr;
+  const hist=errHist[s];
+  xLab(ctx,dpr,L,R,B);
+  ctx.strokeStyle="#1b2230";for(const f of [0,.5,1]){const py=T+f*(B-T);ctx.beginPath();ctx.moveTo(L,py);ctx.lineTo(R,py);ctx.stroke();}
+  if(hist.length<2)return;
+  let mxP=1,mxD=1;for(const r of hist){mxP=Math.max(mxP,r[0]);mxD=Math.max(mxD,r[1]);}mxP*=1.15;mxD*=1.15;
+  const yP=v=>T+(1-v/mxP)*(B-T),yD=v=>T+(1-v/mxD)*(B-T);
+  ctx.textBaseline="middle";
+  ctx.fillStyle="#ec407a";ctx.textAlign="right";for(const f of [0,.5,1]){const py=T+f*(B-T);ctx.fillText((mxP*(1-f)).toFixed(0),L-4*dpr,py);}
+  ctx.fillStyle="#3f51b5";ctx.textAlign="left"; for(const f of [0,.5,1]){const py=T+f*(B-T);ctx.fillText((mxD*(1-f)).toFixed(1),R+4*dpr,py);}
+  const xof=i=>L+((i+(HIST-hist.length))/(HIST-1))*(R-L);ctx.lineWidth=dpr*1.5;
+  ctx.strokeStyle="#ec407a";ctx.beginPath();for(let i=0;i<hist.length;i++){const px=xof(i),py=yP(hist[i][0]);i?ctx.lineTo(px,py):ctx.moveTo(px,py);}ctx.stroke();
+  ctx.strokeStyle="#3f51b5";ctx.beginPath();for(let i=0;i<hist.length;i++){const px=xof(i),py=yD(hist[i][1]);i?ctx.lineTo(px,py):ctx.moveTo(px,py);}ctx.stroke();
+}
+
+// ---- button enable logic (mirrors dashboard _btn_state) ----
+function updateButtons(s,a){
+  const busy=BUSY.has(a.mode);
+  for(const b of [...MODE,...TEACH,...ARC]){
+    const el=document.querySelector(`#btns-${s} button[data-b="${b}"]`);if(!el)continue;
+    let dis=false;
+    if(b==="disable")dis=false;
+    else if(busy)dis=true;
+    else if(b==="go_start")dis=!a.taught[0];
+    else if(b==="go_end"||b==="line_run")dis=!a.taught[1];
+    else if(b==="arc_start")dis=a.arc_n<1;
+    else if(b==="arc_run"||b==="replay_run"||b==="bspline_run")dis=a.arc_n<2;
+    else if(MODE.includes(b)&&({enable:"ZERO_TORQUE",hold:"ENABLED_HOLD",home:"HOMING",disable:"DISABLED"})[b]===a.mode)dis=true;
+    el.disabled=dis;
+  }
+}
+
+// ---- error readout (steady-state holds after motion; shows direction) ----
+function sgn(v,d=1){return (v>=0?"+":"")+Number(v).toFixed(d);}
+function fmtErr(e){
+  const [dx,dy,dz]=e.pos,[r,p,y]=e.ori;   // d=actual−planned, body frame: x前 y左 z上
+  const pa=[["前","后",dx],["左","右",dy],["上","下",dz]].sort((a,b)=>Math.abs(b[2])-Math.abs(a[2]))[0];
+  const oa=[["滚R",r],["俯P",p],["偏Y",y]].sort((a,b)=>Math.abs(b[1])-Math.abs(a[1]))[0];
+  return `位置 ${e.pmag}mm  (前${sgn(dx)} 左${sgn(dy)} 上${sgn(dz)}) → 偏${pa[2]>=0?pa[0]:pa[1]} ${Math.abs(pa[2]).toFixed(1)}mm\n`+
+         `姿态 ${e.omag}°  (R${sgn(r)} P${sgn(p)} Y${sgn(y)}) → ${oa[0]} ${Math.abs(oa[1]).toFixed(2)}°`;
+}
+
+// ---- render an SSE snapshot ----
+function render(snap){
+  for(const s of SIDES){
+    const a=snap.arms[s];if(!a)continue;
+    document.getElementById("mode-"+s).textContent=`模式: ${a.mode} | 使能: ${a.enabled?"ON":"off"}`;
+    const t=a.tmos_max;const col=t>70?"#ff6b6b":t>55?"#ffd166":"#43a047";
+    document.getElementById("tmp-"+s).innerHTML=`<span style="color:${col}">● MOS ${t.toFixed(0)}°C</span>`;
+    document.getElementById("taught-"+s).textContent=`起点${a.taught[0]?"✓":"·"} 终点${a.taught[1]?"✓":"·"} 弧线:${a.arc_n}  CAN:${a.can_up?"✓":"✗"}`;
+    document.getElementById("prog-"+s).style.width=(a.progress*100)+"%";
+    const gv=document.getElementById("gv-"+s),gs=document.getElementById("gs-"+s),gl=document.getElementById("gl-"+s);
+    if(gv){gv.checked=!!a.grav_on;gv.disabled=!a.enabled;}
+    if(gs&&document.activeElement!==gs)gs.value=a.grav_scale;
+    if(gl)gl.textContent=(a.grav_scale||0).toFixed(2);
+    jointHist[s].push(a.joints);if(jointHist[s].length>HIST)jointHist[s].shift();
+    if(a.err){
+      errHist[s].push([a.err.pmag,a.err.omag]); if(errHist[s].length>HIST) errHist[s].shift();
+      const et=document.getElementById("errtxt-"+s); if(et) et.textContent=fmtErr(a.err);
+    } else {
+      if(errHist[s].length) errHist[s]=[];
+      const et=document.getElementById("errtxt-"+s); if(et) et.textContent="（使能 + 抱住/运动 后显示稳态误差与方向）";
+    }
+    drawJoints(s);drawErr(s);
+    updateButtons(s,a);
+  }
+  document.getElementById("canbar").textContent="CAN: "+SIDES.map(s=>`${s} ${snap.arms[s].can_up?"✓UP":"✗DOWN"}`).join("  |  ");
+  // tune sync
+  const t=snap.tune||{};setIf("t-slowdown",t.slowdown);setIf("t-cap",t.cap);setIf("t-maxspeed",t.maxspeed);setIf("t-freq",t.freq);
+  const m=t.mode;document.querySelectorAll('input[name=mode]').forEach(r=>{r.checked=(r.value===m);});
+  const logTxt=(snap.log||[]).join("\n");if(logTxt!==lastLog){lastLog=logTxt;document.getElementById("log").textContent=logTxt;}
+}
+function setIf(id,v){if(v!=null){const e=document.getElementById(id);if(e&&document.activeElement!==e)e.value=v;}}
+
+// ---- actions ----
+async function post(url,body){try{await fetch(url,{method:"POST",headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});}catch(e){}}
+function onClick(s,el){
+  if(el.tagName!=="BUTTON")return;const b=el.dataset.b;if(!b||el.disabled)return;
+  if(MODE.includes(b))post("/mode",{side:s,action:b});
+  else if(b==="record_start"||b==="record_end")post("/teach",{side:s,which:b.endsWith("start")?"start":"end"});
+  else post("/action",{side:s,op:b});
+}
+// tune bar (debounced)
+let tt=null;
+function armTune(){clearTimeout(tt);tt=setTimeout(()=>{post("/tune",{
+  slowdown:parseFloat(v("t-slowdown")),cap:parseFloat(v("t-cap")),
+  mode:(document.querySelector('input[name=mode]:checked')||{}).value||undefined,
+  maxspeed:parseFloat(v("t-maxspeed")),freq:parseFloat(v("t-freq"))});},300);}
+function v(id){return document.getElementById(id).value;}
+["t-slowdown","t-cap","t-maxspeed","t-freq"].forEach(id=>document.getElementById(id).addEventListener("input",armTune));
+document.querySelectorAll('input[name=mode]').forEach(r=>r.addEventListener("change",armTune));
+for(const s of SIDES){
+  document.getElementById("gv-"+s).addEventListener("change",()=>sendGrav(s));
+  const gs=document.getElementById("gs-"+s);let gt=null;
+  gs.addEventListener("input",()=>{document.getElementById("gl-"+s).textContent=parseFloat(gs.value).toFixed(2);clearTimeout(gt);gt=setTimeout(()=>sendGrav(s),150);});
+}
+function sendGrav(s){post("/gravity",{side:s,on:document.getElementById("gv-"+s).checked,scale:parseFloat(document.getElementById("gs-"+s).value)});}
+
+// ---- SSE connect with reconnect + staleness pill ----
+let lastTick=0,backoff=1000;
+function connect(){
+  const es=new EventSource("/sse/stream");
+  es.onmessage=(e)=>{backoff=1000;lastTick=performance.now();try{render(JSON.parse(e.data));}catch(err){console.error(err);}};
+  es.onerror=()=>{es.close();setTimeout(connect,backoff);backoff=Math.min(backoff*1.6,8000);};
+}
+connect();
+fetch("/state").then(r=>r.json()).then(render).catch(()=>{});
+setInterval(()=>{const p=document.getElementById("livepill");const age=lastTick?(performance.now()-lastTick)/1000:0;
+  p.textContent=age?`live ${age.toFixed(1)}s`:"live: connecting…";p.classList.toggle("stale",!lastTick||age>2);},1000);
+addEventListener("resize",()=>SIDES.forEach(s=>{drawJoints(s);drawErr(s);}));
+</script>
+</body>
+</html>

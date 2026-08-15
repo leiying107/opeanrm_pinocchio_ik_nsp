@@ -128,6 +128,16 @@ class ArmBaseline:
     sum_effort_sq: np.ndarray | None = None  # 7x1  # For std computation
     sum_effort_minus_g_sq: np.ndarray | None = None  # 7x1
     is_valid: bool = False
+    # --- Robust per-joint noise stats for the JOINT RESIDUAL detector ---
+    # Collected only during calibration, then summarized and cleared.
+    effort_sample_buffer: list | None = field(default_factory=list)  # list of 7-vectors
+    effort_minus_g_sample_buffer: list | None = field(default_factory=list)  # list of 7-vectors
+    median_effort: np.ndarray | None = None  # 7x1
+    mad_effort: np.ndarray | None = None  # 7x1 (median absolute deviation)
+    sigma_robust_effort: np.ndarray | None = None  # 7x1 = 1.4826 * MAD
+    median_effort_minus_g: np.ndarray | None = None  # 7x1
+    mad_effort_minus_g: np.ndarray | None = None  # 7x1
+    sigma_robust_effort_minus_g: np.ndarray | None = None  # 7x1 = 1.4826 * MAD
 
 
 @dataclass
@@ -243,6 +253,9 @@ class ArmState:
     motion_phase: MotionPhase = MotionPhase.UNKNOWN
     node_state: NodeState = NodeState.INIT
     invalid_reason: str = ""
+    # JOINT RESIDUAL detector result (Jacobian-independent). Filled every sample
+    # BEFORE the Cartesian metrics / Jacobian gate. See JointResidualResult.
+    joint_detector: JointResidualResult | None = None
 
 
 @dataclass
@@ -474,6 +487,328 @@ def nan_to_str(x: float | None) -> str:
 
 
 # -----------------------------------------------------------------------------
+# JOINT RESIDUAL COLLISION DETECTOR  (Jacobian-independent, SHADOW/TEST only)
+# -----------------------------------------------------------------------------
+#
+# This detector is INTENTIONALLY fully decoupled from the Cartesian Fxy /
+# Jacobian pipeline. It answers exactly one question:
+#
+#     "Is there an abnormal external contact?"  (yes / no)
+#
+# It does NOT answer "which direction". It therefore never references Fx/Fy/Fz,
+# J_xy, TCP position/orientation, or the Jacobian reliability gate. It runs and
+# produces a result BEFORE the Jacobian reliability gate, condition-number /
+# sigma_min checks, Fxy solve, or any Cartesian early-return. Jacobian
+# unreliability NEVER disables or resets this detector.
+#
+# Pipeline (all in this section):
+#   effort - calibrated baseline  ==  tau_residual   (raw, preferred)
+#                                     OR effort - gravity - minus_g baseline
+#   -> abs(tau_residual[i]) / threshold[i] = ratio[i]   (per-joint threshold)
+#   -> joint_score = max(ratio)
+#   -> hold/debounce + hysteresis (release ratio) + optional latch
+#   -> JOINT COLLISION
+#
+# All thresholds generated here are SHADOW / TEST thresholds, NOT final safety
+# thresholds. Real-machine calibration is still required.
+
+# States reported by the joint residual detector. NOT_READY means the baseline
+# is not calibrated yet; INVALID_INPUT means effort/baseline data is missing,
+# the wrong length, or non-finite. Neither of those two computes a score or can
+# trip. ACTIVE/TRIPPED are the only states that run normal threshold logic.
+JR_STATE_ACTIVE = "ACTIVE"
+JR_STATE_TRIPPED = "TRIPPED"
+JR_STATE_NOT_READY = "NOT_READY"
+JR_STATE_INVALID = "INVALID_INPUT"
+JR_STATE_DISABLED = "DISABLED"
+
+
+@dataclass
+class JointResidualResult:
+    """One step of the JOINT RESIDUAL detector (Jacobian-independent)."""
+    state: str  # one of JR_STATE_*
+    latched: bool
+    source: str  # 'raw' | 'minus_g' (filled by caller)
+    tau_residual: np.ndarray | None = None  # 7x1, the residual that was judged
+    threshold: np.ndarray | None = None  # 7x1, SHADOW/TEST threshold used
+    ratio: np.ndarray | None = None  # 7x1, |tau_residual| / threshold
+    sigma_robust: np.ndarray | None = None  # 7x1, robust noise (diagnostic)
+    joint_score: float = 0.0  # max(ratio)
+    max_joint_index: int = -1
+    max_joint_name: str = "-"
+    max_joint_residual: float = 0.0
+    max_joint_threshold: float = 0.0
+    max_joint_ratio: float = 0.0
+    hold_time_ms: float = 0.0  # how long score has been sustained >= 1.0
+    collision: bool = False  # currently in collision this frame (incl. latch)
+    trip_edge: bool = False  # rising edge of `collision` this frame
+    invalid_reason: str = ""
+    max_abs_dq: float = 0.0  # diagnostic only, NOT used for tripping
+
+
+def build_joint_tau_residual(
+    source: str,
+    effort: np.ndarray | None,
+    effort_baseline: np.ndarray | None,
+    effort_minus_g_baseline: np.ndarray | None,
+    gravity: np.ndarray | None,
+) -> tuple[np.ndarray | None, str | None, str]:
+    """Build the per-joint residual from calibrated baseline.
+
+    Returns (tau_residual, error_state, reason). When tau_residual is None,
+    error_state is a JR_STATE_* and reason explains why; the caller must NOT
+    compute a score or trip in that case.
+
+    First-level safety uses the RAW residual (effort - calibrated baseline),
+    matching the existing tau_raw_zeroed. We do not substitute model gravity
+    compensation on our own initiative.
+    """
+    if effort is None:
+        return None, JR_STATE_INVALID, "effort_missing"
+    eff = np.asarray(effort, dtype=float)
+    if eff.shape != (7,):
+        return None, JR_STATE_INVALID, "effort_shape"
+    if not np.all(np.isfinite(eff)):
+        return None, JR_STATE_INVALID, "effort_not_finite"
+
+    if source == "minus_g":
+        if effort_minus_g_baseline is None:
+            return None, JR_STATE_NOT_READY, "minus_g_baseline_not_ready"
+        if gravity is None:
+            return None, JR_STATE_INVALID, "gravity_unavailable"
+        g = np.asarray(gravity, dtype=float)
+        b = np.asarray(effort_minus_g_baseline, dtype=float)
+        if g.shape != (7,) or b.shape != (7,):
+            return None, JR_STATE_INVALID, "minus_g_shape"
+        if not (np.all(np.isfinite(g)) and np.all(np.isfinite(b))):
+            return None, JR_STATE_INVALID, "minus_g_not_finite"
+        tau = eff - g - b
+    else:  # "raw" (preferred first-level safety)
+        if effort_baseline is None:
+            return None, JR_STATE_NOT_READY, "baseline_not_ready"
+        b = np.asarray(effort_baseline, dtype=float)
+        if b.shape != (7,):
+            return None, JR_STATE_INVALID, "baseline_shape"
+        if not np.all(np.isfinite(b)):
+            return None, JR_STATE_INVALID, "baseline_not_finite"
+        tau = eff - b
+
+    if not np.all(np.isfinite(tau)):
+        return None, JR_STATE_INVALID, "tau_not_finite"
+    return tau, None, ""
+
+
+def compute_joint_thresholds(
+    sigma_robust: np.ndarray | None,
+    min_thresholds: np.ndarray,
+    noise_multiplier: float,
+) -> np.ndarray:
+    """Build SHADOW/TEST per-joint thresholds.
+
+        threshold_i = max(configured_min_threshold_i, noise_multiplier * sigma_robust_i)
+
+    sigma_robust is the robust per-joint noise (1.4826 * MAD) from calibration.
+    If it is unavailable, thresholds fall back to the configured minimums. The
+    result is clamped away from zero so ratio = |tau|/threshold is always finite.
+    """
+    min_thr = np.asarray(min_thresholds, dtype=float)
+    if sigma_robust is None:
+        noise = np.zeros_like(min_thr)
+    else:
+        sig = np.asarray(sigma_robust, dtype=float)
+        if sig.shape != min_thr.shape or not np.all(np.isfinite(sig)):
+            noise = np.zeros_like(min_thr)
+        else:
+            noise = float(noise_multiplier) * sig
+    thr = np.maximum(min_thr, noise)
+    return np.where(thr > 1e-9, thr, 1e-9)
+
+
+class JointResidualDetector:
+    """Pure (rclpy/pinocchio-free) per-joint residual collision detector.
+
+    Holds only the hysteresis / debounce / latch state. It takes a ready
+    tau_residual + threshold each step and returns a JointResidualResult. It has
+    NO knowledge of the Jacobian, Cartesian forces, or TCP pose, so it can be
+    unit-tested offline and run before the Jacobian reliability gate.
+    """
+
+    def __init__(
+        self,
+        joint_names: list[str],
+        hold_ms: float,
+        release_ratio: float,
+        latch: bool,
+    ) -> None:
+        self.joint_names = list(joint_names)
+        self.hold_seconds = float(hold_ms) / 1000.0
+        self.release_ratio = float(release_ratio)
+        self.latch = bool(latch)
+        self._armed = False  # currently in the >= trip-threshold region
+        self._hold_start = 0.0  # monotonic time when armed region was entered
+        self._latched = False  # sticky latch (only when self.latch is True)
+        self._was_collision = False  # for rising-edge detection
+        self.trip_count = 0
+
+    @property
+    def is_latched(self) -> bool:
+        """Whether the latch has ever fired (latch mode only)."""
+        return self._latched
+
+    def reset(self) -> None:
+        """Full reset of detector state."""
+        self._armed = False
+        self._hold_start = 0.0
+        self._latched = False
+        self._was_collision = False
+
+    def disarm(self) -> None:
+        """Drop the current hold candidate (e.g. on NOT_READY/INVALID input).
+
+        Keeps the latch and trip_count so a previously observed collision is not
+        silently forgotten.
+        """
+        self._armed = False
+        self._hold_start = 0.0
+
+    def step(
+        self,
+        tau_residual: np.ndarray,
+        threshold: np.ndarray,
+        now: float,
+        max_abs_dq: float = 0.0,
+    ) -> JointResidualResult:
+        """Evaluate one sample. Mutates hysteresis/latch state, returns result."""
+        tau = np.asarray(tau_residual, dtype=float)
+        thr = np.asarray(threshold, dtype=float)
+        n = tau.shape[0]
+
+        abs_res = np.abs(tau)
+        safe_thr = np.where(thr > 1e-9, thr, 1e-9)
+        ratio = abs_res / safe_thr
+        score = float(np.max(ratio)) if n > 0 else 0.0
+        idx = int(np.argmax(ratio)) if n > 0 else -1
+
+        # ---- Hysteresis + debounce (direction-agnostic) ----
+        # Enter the armed region when score >= 1.0; leave it only when score
+        # drops below release_ratio (< 1.0). While armed, accumulate hold time;
+        # trip once hold >= hold_seconds. We key the hold accumulation off the
+        # _armed flag (NOT off _hold_start > 0) so arming at now==0 still works.
+        if self._armed:
+            if score < self.release_ratio:
+                self._armed = False
+                self._hold_start = 0.0
+        else:
+            if score >= 1.0:
+                self._armed = True
+                self._hold_start = now
+
+        if self._armed:
+            hold_time_s = max(0.0, now - self._hold_start)
+        else:
+            hold_time_s = 0.0
+
+        raw_collision = self._armed and (hold_time_s >= self.hold_seconds)
+        if raw_collision and self.latch:
+            self._latched = True
+        collision = bool(self._latched) if self.latch else bool(raw_collision)
+
+        trip_edge = collision and not self._was_collision
+        if trip_edge:
+            self.trip_count += 1
+        self._was_collision = collision
+
+        max_name = self.joint_names[idx] if 0 <= idx < len(self.joint_names) else "-"
+        return JointResidualResult(
+            state=JR_STATE_TRIPPED if collision else JR_STATE_ACTIVE,
+            latched=bool(self._latched) if self.latch else False,
+            source="",  # filled by the caller
+            tau_residual=tau,
+            threshold=thr,
+            ratio=ratio,
+            joint_score=score,
+            max_joint_index=idx,
+            max_joint_name=max_name,
+            max_joint_residual=float(abs_res[idx]) if idx >= 0 else 0.0,
+            max_joint_threshold=float(thr[idx]) if idx >= 0 else 0.0,
+            max_joint_ratio=float(ratio[idx]) if idx >= 0 else 0.0,
+            hold_time_ms=hold_time_s * 1000.0,
+            collision=collision,
+            trip_edge=trip_edge,
+            max_abs_dq=float(max_abs_dq),
+        )
+
+
+def evaluate_joint_residual_step(
+    detector: JointResidualDetector,
+    *,
+    enabled: bool,
+    baseline_ready: bool,
+    source: str,
+    effort: np.ndarray | None,
+    effort_baseline: np.ndarray | None,
+    effort_minus_g_baseline: np.ndarray | None,
+    gravity: np.ndarray | None,
+    sigma_robust: np.ndarray | None,
+    min_thresholds: np.ndarray,
+    noise_multiplier: float,
+    now: float,
+    max_abs_dq: float = 0.0,
+) -> JointResidualResult:
+    """Full pure step: readiness/invalid classification + detector.step.
+
+    This is the single entry point the node calls. It is rclpy/pinocchio-free so
+    the exact classification (NOT_READY / INVALID_INPUT / ACTIVE / TRIPPED) is
+    unit-testable offline. Order of checks matters: a NOT_READY or INVALID input
+    disarms the detector and NEVER computes a score or trips.
+    """
+    if not enabled:
+        detector.disarm()
+        return JointResidualResult(
+            state=JR_STATE_DISABLED, latched=detector.is_latched,
+            source=source, invalid_reason="detector_disabled",
+        )
+
+    if not baseline_ready:
+        detector.disarm()
+        return JointResidualResult(
+            state=JR_STATE_NOT_READY, latched=detector.is_latched,
+            source=source, invalid_reason="baseline_not_ready",
+        )
+
+    tau, err_state, reason = build_joint_tau_residual(
+        source, effort, effort_baseline, effort_minus_g_baseline, gravity,
+    )
+    if tau is None:
+        detector.disarm()
+        return JointResidualResult(
+            state=err_state or JR_STATE_INVALID, latched=detector.is_latched,
+            source=source, invalid_reason=reason,
+        )
+
+    threshold = compute_joint_thresholds(
+        sigma_robust, min_thresholds, noise_multiplier,
+    )
+    result = detector.step(tau, threshold, now, max_abs_dq=max_abs_dq)
+    result.source = source
+    result.sigma_robust = sigma_robust
+    return result
+
+
+# CSV columns appended (as a contiguous block) by the joint residual detector.
+# Order MUST match _joint_detector_csv_extra().
+JOINT_DETECTOR_CSV_COLUMNS: list[str] = (
+    ["joint_collision", "joint_collision_latched", "joint_collision_score",
+     "joint_collision_state", "joint_collision_max_joint",
+     "joint_collision_max_residual", "joint_collision_max_threshold",
+     "joint_collision_hold_ms"]
+    + [f"tau_residual_j{i}" for i in range(1, 8)]
+    + [f"threshold_j{i}" for i in range(1, 8)]
+    + [f"ratio_j{i}" for i in range(1, 8)]
+)
+
+
+# -----------------------------------------------------------------------------
 # Main Node
 # -----------------------------------------------------------------------------
 
@@ -531,6 +866,17 @@ class TCPCollisionMonitorShadowNode(Node):
         self.trip_hold_time = params["trip_hold_time_sec"]
         self.clear_hold_time = params["clear_hold_time_sec"]
 
+        # Joint residual detector parameters (Jacobian-independent, SHADOW/TEST)
+        self.enable_joint_residual_detector = params["enable_joint_residual_detector"]
+        self.joint_residual_source = params["joint_residual_source"]
+        self.joint_residual_noise_multiplier = params["joint_residual_noise_multiplier"]
+        self.joint_residual_min_thresholds = np.array(
+            params["joint_residual_min_thresholds"], dtype=float)
+        self.joint_residual_hold_ms = params["joint_residual_hold_ms"]
+        self.joint_residual_release_ratio = params["joint_residual_release_ratio"]
+        self.joint_residual_latch = params["joint_residual_latch"]
+        self.joint_residual_print_rate_hz = params["joint_residual_print_rate_hz"]
+
         # CSV parameters
         self.csv_path = params["csv_path"]
         self.flush_interval = params["flush_interval_sec"]
@@ -562,6 +908,18 @@ class TCPCollisionMonitorShadowNode(Node):
                 state.online_stats.moving[metric] = OnlineStats()
                 state.online_stats.all_samples[metric] = OnlineStats()
 
+        # Joint residual detectors (Jacobian-independent). One per side.
+        # Pure state machines; the node feeds them ready residuals + thresholds.
+        self.joint_detectors: dict[str, JointResidualDetector] = {}
+        for side in self.sides:
+            joint_names = [f"openarm_{side}_joint{i}" for i in range(1, 8)]
+            self.joint_detectors[side] = JointResidualDetector(
+                joint_names=joint_names,
+                hold_ms=self.joint_residual_hold_ms,
+                release_ratio=self.joint_residual_release_ratio,
+                latch=self.joint_residual_latch,
+            )
+
         # Track last times
         self.last_joint_state_time: dict[str, float] = {side: 0.0 for side in self.sides}
         self.last_controller_state_time: dict[str, float] = {side: 0.0 for side in self.sides}
@@ -579,6 +937,12 @@ class TCPCollisionMonitorShadowNode(Node):
         print_period = 1.0 / self.print_rate
         self.create_timer(sample_period, self._sample_timer_callback)
         self.create_timer(print_period, self._print_timer_callback)
+
+        # Joint residual detector print timer (independent cadence). Disabled
+        # when <= 0; the detector itself still runs every sample regardless.
+        if self.joint_residual_print_rate_hz > 0:
+            joint_print_period = 1.0 / self.joint_residual_print_rate_hz
+            self.create_timer(joint_print_period, self._print_joint_residual_callback)
 
         # Flush timer
         if self.csv_path and self.flush_interval > 0:
@@ -627,6 +991,18 @@ class TCPCollisionMonitorShadowNode(Node):
         self.declare_parameter("hard_trip_force_norm", 0.0)
         self.declare_parameter("trip_hold_time_sec", 0.03)
         self.declare_parameter("clear_hold_time_sec", 0.2)
+
+        # Joint residual collision detector (Jacobian-independent, SHADOW/TEST).
+        # Runs before and fully decoupled from the Cartesian Fxy / Jacobian gate.
+        # All thresholds it produces are TEST thresholds, not final safety ones.
+        self.declare_parameter("enable_joint_residual_detector", True)
+        self.declare_parameter("joint_residual_source", "raw")
+        self.declare_parameter("joint_residual_noise_multiplier", 6.0)
+        self.declare_parameter("joint_residual_min_thresholds", [0.3] * 7)
+        self.declare_parameter("joint_residual_hold_ms", 30.0)
+        self.declare_parameter("joint_residual_release_ratio", 0.8)
+        self.declare_parameter("joint_residual_latch", True)
+        self.declare_parameter("joint_residual_print_rate_hz", 1.0)
 
         # Logging
         self.declare_parameter("csv_path", "")
@@ -696,6 +1072,53 @@ class TCPCollisionMonitorShadowNode(Node):
         params["hard_trip_force_norm"] = float(self.get_parameter("hard_trip_force_norm").value)
         params["trip_hold_time_sec"] = float(self.get_parameter("trip_hold_time_sec").value)
         params["clear_hold_time_sec"] = float(self.get_parameter("clear_hold_time_sec").value)
+
+        # Joint residual detector (Jacobian-independent, SHADOW/TEST)
+        params["enable_joint_residual_detector"] = bool(
+            self.get_parameter("enable_joint_residual_detector").value)
+
+        jr_source = self.get_parameter("joint_residual_source").value
+        if jr_source not in ("raw", "minus_g"):
+            self.get_logger().error(
+                f"Invalid joint_residual_source '{jr_source}' - must be 'raw' or 'minus_g'"
+            )
+            raise ValueError(
+                f"joint_residual_source must be 'raw' or 'minus_g', got '{jr_source}'"
+            )
+        params["joint_residual_source"] = jr_source
+
+        params["joint_residual_noise_multiplier"] = float(
+            self.get_parameter("joint_residual_noise_multiplier").value)
+
+        jr_min_thr = list(self.get_parameter("joint_residual_min_thresholds").value)
+        if len(jr_min_thr) != 7:
+            raise ValueError(
+                f"joint_residual_min_thresholds must have 7 values, got {len(jr_min_thr)}"
+            )
+        try:
+            jr_min_thr = [float(v) for v in jr_min_thr]
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"joint_residual_min_thresholds must be numeric: {e}")
+        if any(not math.isfinite(v) for v in jr_min_thr):
+            raise ValueError("joint_residual_min_thresholds must all be finite")
+        if any(v <= 0.0 for v in jr_min_thr):
+            raise ValueError("joint_residual_min_thresholds must all be > 0")
+        params["joint_residual_min_thresholds"] = jr_min_thr
+
+        params["joint_residual_hold_ms"] = float(
+            self.get_parameter("joint_residual_hold_ms").value)
+
+        jr_release = float(self.get_parameter("joint_residual_release_ratio").value)
+        if not (0.0 < jr_release <= 1.0):
+            raise ValueError(
+                f"joint_residual_release_ratio must be in (0, 1], got {jr_release}"
+            )
+        params["joint_residual_release_ratio"] = jr_release
+
+        params["joint_residual_latch"] = bool(
+            self.get_parameter("joint_residual_latch").value)
+        params["joint_residual_print_rate_hz"] = float(
+            self.get_parameter("joint_residual_print_rate_hz").value)
 
         # CSV
         params["csv_path"] = self.get_parameter("csv_path").value
@@ -936,6 +1359,7 @@ class TCPCollisionMonitorShadowNode(Node):
                 state.node_state = NodeState.ERROR
                 state.invalid_reason = "no_joint_data"
                 self._reset_trip_timer(side)  # Reset timer on error
+                self._set_joint_detector_invalid(side, JR_STATE_INVALID, "no_joint_data")
                 continue
 
             # Check data validity
@@ -943,6 +1367,7 @@ class TCPCollisionMonitorShadowNode(Node):
                 state.node_state = NodeState.ERROR
                 state.invalid_reason = "no_joint_data"
                 self._reset_trip_timer(side)  # Reset timer on error
+                self._set_joint_detector_invalid(side, JR_STATE_INVALID, "no_joint_data")
                 continue
 
             # Check timeout
@@ -951,6 +1376,7 @@ class TCPCollisionMonitorShadowNode(Node):
                 state.node_state = NodeState.STALE
                 state.invalid_reason = f"joint_state_timeout_{js_age:.2f}s"
                 self._reset_trip_timer(side)  # Reset timer on stale data
+                self._set_joint_detector_invalid(side, JR_STATE_INVALID, "joint_state_timeout")
                 continue
 
             controller_age = now - state.controller_data.timestamp
@@ -964,7 +1390,14 @@ class TCPCollisionMonitorShadowNode(Node):
                 if state.baseline.is_valid:
                     state.node_state = NodeState.READY
 
-            # Compute metrics
+            # ---- JOINT RESIDUAL DETECTOR (Jacobian-independent) --------------
+            # Runs BEFORE and fully independent of the Cartesian metrics /
+            # Jacobian reliability gate below. A None metric result, an
+            # unreliable Jacobian, or a failed Fxy solve never reaches into this
+            # detector; it only needs joint effort + a calibrated baseline.
+            self._update_joint_residual_detector(side, now)
+
+            # Compute metrics (Cartesian / Jacobian pipeline) - decoupled path
             metrics = self._compute_metrics(side)
 
             if metrics is None:
@@ -1029,6 +1462,8 @@ class TCPCollisionMonitorShadowNode(Node):
             state.baseline.std_effort_minus_g = np.zeros(7)
             state.baseline.sum_effort_sq = np.zeros(7)
             state.baseline.sum_effort_minus_g_sq = np.zeros(7)
+            state.baseline.effort_sample_buffer = []
+            state.baseline.effort_minus_g_sample_buffer = []
 
         # Compute gravity
         model = self.models[side]
@@ -1060,6 +1495,13 @@ class TCPCollisionMonitorShadowNode(Node):
         # sum_sq += (x - old_mean) * (x - new_mean)
         effort = state.joint_data.effort
         effort_minus_g = effort - gravity
+
+        # Buffer raw samples for robust (MAD-based) noise stats used by the
+        # JOINT RESIDUAL detector. Cleared once calibration completes.
+        if state.baseline.effort_sample_buffer is not None:
+            state.baseline.effort_sample_buffer.append(effort.copy())
+        if state.baseline.effort_minus_g_sample_buffer is not None:
+            state.baseline.effort_minus_g_sample_buffer.append(effort_minus_g.copy())
 
         if n == 0:
             state.baseline.sum_effort_sq = np.zeros(7)
@@ -1109,12 +1551,34 @@ class TCPCollisionMonitorShadowNode(Node):
                     state.baseline.sum_effort_minus_g_sq / (state.baseline.samples - 1)
                 )
 
+            # Robust per-joint noise (median, MAD, sigma_robust = 1.4826*MAD)
+            # for the JOINT RESIDUAL detector. More outlier-resistant than std.
+            (state.baseline.median_effort,
+             state.baseline.mad_effort,
+             state.baseline.sigma_robust_effort) = self._compute_robust_noise(
+                state.baseline.effort_sample_buffer)
+            (state.baseline.median_effort_minus_g,
+             state.baseline.mad_effort_minus_g,
+             state.baseline.sigma_robust_effort_minus_g) = self._compute_robust_noise(
+                state.baseline.effort_minus_g_sample_buffer)
+            # Free the raw sample buffers; stats are all we need downstream.
+            state.baseline.effort_sample_buffer = None
+            state.baseline.effort_minus_g_sample_buffer = None
+
             state.baseline.is_valid = True
             self.get_logger().info(
                 f"{side.upper()}: Baseline calibration complete "
                 f"({state.baseline.samples} samples, "
                 f"max_dq={max_abs_dq:.4f} rad/s)"
             )
+            if state.baseline.sigma_robust_effort is not None:
+                sig = state.baseline.sigma_robust_effort
+                self.get_logger().info(
+                    f"{side.upper()}: JOINT RESIDUAL robust noise "
+                    f"(sigma_robust = 1.4826*MAD), Nm: "
+                    f"min={np.min(sig):.4f} max={np.max(sig):.4f} mean={np.mean(sig):.4f} "
+                    f"(SHADOW/TEST baseline noise)"
+                )
 
     def _compute_metrics(self, side: str) -> CollisionMetrics | None:
         """Compute collision metrics for one arm."""
@@ -1349,6 +1813,210 @@ class TCPCollisionMonitorShadowNode(Node):
                 shadow.state = ShadowState.ARMED
                 shadow.warning_start_time = 0.0
 
+    # ------------------------------------------------------------------
+    # JOINT RESIDUAL detector node-side glue.
+    # The math/state lives in the pure JointResidualDetector /
+    # evaluate_joint_residual_step helpers above; these methods only gather
+    # ROS inputs, print, and export to CSV. None of them reference the
+    # Jacobian or Cartesian forces for the trip decision.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _compute_robust_noise(buf):
+        """Return (median, MAD, sigma_robust=1.4826*MAD) per joint, or Nones."""
+        if not buf:
+            return None, None, None
+        arr = np.asarray(buf, dtype=float)
+        if arr.ndim != 2 or arr.shape[1] != 7:
+            return None, None, None
+        median = np.median(arr, axis=0)
+        mad = np.median(np.abs(arr - median), axis=0)
+        sigma = 1.4826 * mad
+        return median, mad, sigma
+
+    def _set_joint_detector_invalid(self, side: str, state: str, reason: str) -> None:
+        """Mark the joint detector NOT_READY/INVALID and drop any pending hold.
+
+        Keeps the latch so a previously observed collision is not erased.
+        """
+        detector = self.joint_detectors[side]
+        detector.disarm()
+        self.arm_states[side].joint_detector = JointResidualResult(
+            state=state,
+            latched=detector.is_latched,
+            source=self.joint_residual_source,
+            invalid_reason=reason,
+        )
+
+    def _update_joint_residual_detector(self, side: str, now: float) -> None:
+        """Run one JOINT RESIDUAL step. Jacobian-independent.
+
+        Only needs joint effort + a calibrated baseline. Model gravity is used
+        only for the (optional) minus_g source and never touches the XY Jacobian.
+        """
+        state = self.arm_states[side]
+        detector = self.joint_detectors[side]
+        source = self.joint_residual_source
+        jd = state.joint_data
+
+        gravity = None
+        if source == "minus_g":
+            effort_baseline_ref = state.baseline.effort_minus_g_baseline
+            sigma = state.baseline.sigma_robust_effort_minus_g
+            baseline_ready = state.baseline.is_valid and effort_baseline_ref is not None
+            if baseline_ready and jd is not None and jd.valid:
+                try:
+                    gravity = self.models[side].gravity(jd.q)
+                except Exception:
+                    gravity = None
+        else:
+            effort_baseline_ref = state.baseline.effort_baseline
+            sigma = state.baseline.sigma_robust_effort
+            baseline_ready = state.baseline.is_valid and effort_baseline_ref is not None
+
+        effort = jd.effort if (jd is not None and jd.valid) else None
+        max_abs_dq = (
+            float(np.max(np.abs(jd.dq)))
+            if (jd is not None and jd.dq is not None)
+            else 0.0
+        )
+
+        result = evaluate_joint_residual_step(
+            detector,
+            enabled=self.enable_joint_residual_detector,
+            baseline_ready=baseline_ready,
+            source=source,
+            effort=effort,
+            effort_baseline=state.baseline.effort_baseline,
+            effort_minus_g_baseline=state.baseline.effort_minus_g_baseline,
+            gravity=gravity,
+            sigma_robust=sigma,
+            min_thresholds=self.joint_residual_min_thresholds,
+            noise_multiplier=self.joint_residual_noise_multiplier,
+            now=now,
+            max_abs_dq=max_abs_dq,
+        )
+        state.joint_detector = result
+
+        if result.trip_edge:
+            self._print_joint_trip(side, result, now)
+
+    def _overall_collision_info(self, side: str):
+        """Combine JOINT RESIDUAL and CARTESIAN XY into overall shadow state.
+
+        Returns (overall_bool, trigger_source, joint_trip, cartesian_trip).
+        Future e-stop primary signal is JOINT_RESIDUAL, not Cartesian Fxy.
+        """
+        state = self.arm_states[side]
+        r = state.joint_detector
+        joint_trip = bool(r.collision) if r is not None else False
+        cartesian_trip = state.shadow_state.trip_latch == TripLatch.TRIPPED
+        overall = joint_trip or cartesian_trip
+        if joint_trip and cartesian_trip:
+            src = "BOTH"
+        elif joint_trip:
+            src = "JOINT_RESIDUAL"
+        elif cartesian_trip:
+            src = "CARTESIAN_XY"
+        else:
+            src = "NONE"
+        return overall, src, joint_trip, cartesian_trip
+
+    def _print_joint_trip(
+        self, side: str, result: JointResidualResult, now: float
+    ) -> None:
+        """Loud banner at the instant the JOINT RESIDUAL detector trips.
+
+        Jacobian / Cartesian values are shown as CONTEXT ONLY and never feed the
+        joint detector.
+        """
+        metrics = self.arm_states[side].metrics
+        if metrics is not None:
+            jac_rel = "YES" if metrics.jacobian_data.is_reliable else "NO"
+            if self.trip_force_source == "minus_g":
+                fxy_norm = float(np.linalg.norm(metrics.external_minus_g))
+            else:
+                fxy_norm = float(np.linalg.norm(metrics.external_raw))
+        else:
+            jac_rel = "N/A"
+            fxy_norm = float('nan')
+
+        self.get_logger().error("")
+        self.get_logger().error("!" * 8 + " JOINT RESIDUAL COLLISION TRIP " + "!" * 8)
+        self.get_logger().error(f"  Side:             {side.upper()}")
+        self.get_logger().error(f"  Joint:            {result.max_joint_name}")
+        self.get_logger().error(f"  Residual:         {result.max_joint_residual:.3f}")
+        self.get_logger().error(f"  Threshold:        {result.max_joint_threshold:.3f}  (SHADOW/TEST)")
+        self.get_logger().error(f"  Ratio:            {result.max_joint_ratio:.2f}")
+        self.get_logger().error(f"  Hold time:        {result.hold_time_ms:.0f} ms")
+        self.get_logger().error(f"  Jacobian reliable:{jac_rel:>4}   (context only - decoupled)")
+        self.get_logger().error(f"  Cartesian Fxy:    {fxy_norm:.3f}   (context only - decoupled)")
+        self.get_logger().error("  NO ROBOT STOP COMMAND WAS SENT.")
+        self.get_logger().error("!" * 48)
+
+    def _print_joint_residual_callback(self) -> None:
+        """Periodic detailed JOINT RESIDUAL block (independent cadence)."""
+        for side in self.sides:
+            r = self.arm_states[side].joint_detector
+            if r is None:
+                continue
+            lines = [
+                "=" * 46,
+                f"JOINT RESIDUAL COLLISION  ({side.upper()})",
+                "=" * 46,
+            ]
+            if r.state in (JR_STATE_NOT_READY, JR_STATE_INVALID, JR_STATE_DISABLED):
+                lines.append(f"State:           {r.state}")
+                lines.append(f"Reason:          {r.invalid_reason}")
+                lines.append(f"Residual source: {r.source or self.joint_residual_source}")
+                lines.append("(no threshold check performed; cannot trip)")
+            else:
+                tau_str = " ".join(f"{v:+.2f}" for v in r.tau_residual) if r.tau_residual is not None else "-"
+                thr_str = " ".join(f"{v:.2f}" for v in r.threshold) if r.threshold is not None else "-"
+                rat_str = " ".join(f"{v:.2f}" for v in r.ratio) if r.ratio is not None else "-"
+                lines.append(f"State:           {r.state}")
+                lines.append(f"Latched:         {'YES' if r.latched else 'NO'}")
+                lines.append(f"Residual source: {r.source}")
+                lines.append(f"tau residual:    {tau_str}")
+                lines.append(f"threshold:       {thr_str}  (SHADOW/TEST)")
+                lines.append(f"ratio:           {rat_str}")
+                lines.append(f"Max joint:       {r.max_joint_name}")
+                lines.append(f"Max residual:    {r.max_joint_residual:.3f}")
+                lines.append(f"Max threshold:   {r.max_joint_threshold:.3f}")
+                lines.append(f"Max ratio:       {r.max_joint_ratio:.2f}")
+                lines.append(f"Hold time:       {r.hold_time_ms:.0f} ms")
+                lines.append(f"Collision:       {'YES' if r.collision else 'NO'}")
+                lines.append(f"max|dq| diag:    {r.max_abs_dq:.3f} rad/s")
+            lines.append("=" * 46)
+            for ln in lines:
+                self.get_logger().info(ln)
+
+    def _joint_detector_csv_extra(self, side: str) -> list:
+        """Extra CSV columns for the JOINT RESIDUAL detector (matches header)."""
+        r = self.arm_states[side].joint_detector
+        if (r is None or r.tau_residual is None
+                or r.threshold is None or r.ratio is None):
+            return [""] * len(JOINT_DETECTOR_CSV_COLUMNS)
+
+        def arr7(a: np.ndarray) -> list:
+            return [nan_to_str(float(v)) for v in a]
+
+        return (
+            [
+                1 if r.collision else 0,
+                1 if r.latched else 0,
+                nan_to_str(r.joint_score),
+                r.state,
+                r.max_joint_name,
+                nan_to_str(r.max_joint_residual),
+                nan_to_str(r.max_joint_threshold),
+                nan_to_str(r.hold_time_ms),
+            ]
+            + arr7(r.tau_residual)
+            + arr7(r.threshold)
+            + arr7(r.ratio)
+        )
+
     def _print_startup_banner(self) -> None:
         """Print startup banner."""
         self.get_logger().info("=" * 70)
@@ -1388,6 +2056,32 @@ class TCPCollisionMonitorShadowNode(Node):
             self.get_logger().info(f"  Warning threshold: {self.warning_force_norm}")
             self.get_logger().info(f"  Trip threshold: {self.trip_force_norm}")
             self.get_logger().info(f"  Hard trip threshold: {self.hard_trip_force_norm}")
+        self.get_logger().info("")
+        self.get_logger().info(
+            f"Joint residual detector: {'ENABLED' if self.enable_joint_residual_detector else 'DISABLED'} "
+            f"(Jacobian-independent, SHADOW/TEST)"
+        )
+        self.get_logger().info(f"  Residual source: {self.joint_residual_source}")
+        self.get_logger().info(
+            f"  Min thresholds (Nm): "
+            f"{' '.join(f'{v:.3f}' for v in self.joint_residual_min_thresholds)}"
+        )
+        self.get_logger().info(
+            f"  Noise multiplier: {self.joint_residual_noise_multiplier} "
+            f"(threshold_i = max(min_i, mult * 1.4826*MAD_i))"
+        )
+        self.get_logger().info(f"  Hold: {self.joint_residual_hold_ms} ms")
+        self.get_logger().info(
+            f"  Release ratio: {self.joint_residual_release_ratio} (hysteresis)"
+        )
+        self.get_logger().info(f"  Latch: {'YES' if self.joint_residual_latch else 'NO'}")
+        self.get_logger().info(
+            f"  Print rate: {self.joint_residual_print_rate_hz} Hz"
+        )
+        self.get_logger().info(
+            "  NOTE: auto-generated thresholds are TEST thresholds, "
+            "NOT final safety thresholds."
+        )
         self.get_logger().info("")
         self.get_logger().info(f"CSV: {'ENABLED' if self.csv_path else 'DISABLED'}")
         if self.csv_path:
@@ -1469,12 +2163,33 @@ class TCPCollisionMonitorShadowNode(Node):
             else:
                 lines.append("Tracking: N/A")
 
-            # Add shadow info
+            # Overall / combined shadow state (JOINT RESIDUAL + CARTESIAN XY)
+            overall, src, joint_trip, cartesian_trip = self._overall_collision_info(side)
+            if self.trip_force_source == "minus_g":
+                cart_fxy_norm = float(np.linalg.norm(metrics.external_minus_g))
+            else:
+                cart_fxy_norm = float(np.linalg.norm(metrics.external_raw))
+            r = state.joint_detector
+            jr_state = r.state if r is not None else JR_STATE_NOT_READY
+            jr_score = r.max_joint_ratio if r is not None else 0.0
+            jr_max = r.max_joint_name if r is not None else "-"
+
+            # Add split + overall shadow info
             lines.extend([
                 "",
-                "Shadow:",
+                "JOINT RESIDUAL:",
+                f"  state={jr_state}, score={jr_score:.2f}, max joint={jr_max}, "
+                f"collision={'YES' if joint_trip else 'NO'}",
+                "CARTESIAN XY:",
+                f"  reliable={'YES' if metrics.jacobian_data.is_reliable else 'NO'}, "
+                f"Fxy norm={cart_fxy_norm:.2f}, tripped={'YES' if cartesian_trip else 'NO'}",
+                "",
+                "Shadow (Cartesian):",
                 f"  warning={'YES' if state.shadow_state.state == ShadowState.SHADOW_WARNING else 'NO'}",
                 f"  tripped={'YES' if state.shadow_state.trip_latch == TripLatch.TRIPPED else 'NO'}",
+                "",
+                f"OVERALL shadow collision: {'YES' if overall else 'NO'}",
+                f"Trigger source: {src}  (future e-stop primary = JOINT_RESIDUAL)",
                 "NO ROBOT STOP COMMAND WAS SENT.",
                 "=" * 70,
             ])
@@ -1525,6 +2240,7 @@ class TCPCollisionMonitorShadowNode(Node):
                 "shadow_warning", "shadow_tripped",
                 "invalid_reason",
             ]
+            header.extend(JOINT_DETECTOR_CSV_COLUMNS)
             self.csv_writer.writerow(header)
             self.get_logger().info(f"CSV header written to {self.csv_path}")
 
@@ -1695,7 +2411,7 @@ class TCPCollisionMonitorShadowNode(Node):
                 invalid_reason=state.invalid_reason,
             )
 
-            self.csv_writer.writerow([
+            row_values = [
                 row.monotonic_time, row.ros_time, row.side, row.node_state, row.motion_phase,
                 row.joint_state_age, row.controller_state_age,
                 row.q1, row.q2, row.q3, row.q4, row.q5, row.q6, row.q7,
@@ -1727,7 +2443,10 @@ class TCPCollisionMonitorShadowNode(Node):
                 row.controller_fields_available,
                 row.shadow_warning, row.shadow_tripped,
                 row.invalid_reason,
-            ])
+            ]
+            # JOINT RESIDUAL detector columns (contiguous block, matches header).
+            row_values.extend(self._joint_detector_csv_extra(side))
+            self.csv_writer.writerow(row_values)
 
             self.csv_row_count += 1
 
@@ -1804,9 +2523,17 @@ class TCPCollisionMonitorShadowNode(Node):
 
             # Shadow stats
             shadow = state.shadow_state
-            self.get_logger().info(f"  Shadow: {shadow.state.value}")
+            self.get_logger().info(f"  Shadow (Cartesian): {shadow.state.value}")
             self.get_logger().info(f"    Warnings: {shadow.warning_count}")
             self.get_logger().info(f"    Trips: {shadow.trip_count}")
+
+            # Joint residual detector stats
+            jd = self.joint_detectors.get(side)
+            if jd is not None:
+                self.get_logger().info(
+                    f"  Joint residual: trips={jd.trip_count}, "
+                    f"latched={'YES' if jd.is_latched else 'NO'}"
+                )
 
         self.get_logger().info("=" * 70)
 
