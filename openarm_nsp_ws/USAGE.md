@@ -2,7 +2,7 @@
 
 > 路径：`/ros2_ws/openarm_nsp_ws/`
 > 目标机器人：OpenArm v1.0（7-DoF × 2 双臂，达妙电机，CAN-FD）
-> 最后更新：2026-08-14（新增 web_panel / 重力补偿 / IK 跟踪误差方向显示）
+> 最后更新：2026-08-17（阻抗：奇异点三层防护 + 落盘调试日志，见 IMPEDANCE_SAFETY.md）
 
 ---
 
@@ -602,6 +602,68 @@ ros2 run openarm_dashboard web_panel --can-slot 1 --port 8050   # 显式
 | `web_panel.py` | ★ 新一代面板：FastAPI + SSE + canvas 后端（推荐） |
 | `static/index.html` | ★ web_panel 前端（原生 JS + canvas） |
 | `gravity.py` | ★ 重力补偿 G(q)（pinocchio on v1_simple.urdf） |
+| `impedance.py` | ★ 笛卡尔 6D 阻抗 + sim 动力学被控对象（aba） |
+| `scripts/test_impedance_sim.py` | ★ 阻抗+奇异防护 6 项 sim 测试套件（headless） |
+| `IMPEDANCE_SAFETY.md` | ★ 阻抗安全启动手册（参数含义/安全位姿/奇异防护/调试日志） |
+| `IMPEDANCE_THEORY.md` | ★ 阻抗原理与实现（控制律/模式机/线程模型/实时性保障） |
 | `hardware_dashboard.py` | 旧版 Dash 面板（fallback） |
 | `arm_controller.py` | 每臂状态机 + 250Hz CAN 工作线程 + 重力前馈注入 |
 | `robot_state.py` | 线程安全状态容器 + 滚动绘图缓冲 |
+
+## 17. 阻抗控制（笛卡尔 6D 弹簧-阻尼）★ 新增
+
+开启后末端呈现可调弹簧-阻尼：手推 → 压缩 → 松手回弹；漏速>0 → 柔顺拖动（锚点跟随）。
+无力传感器时 `F_est = K·Δx` 估计接触力（sim 实测 20N 推力 → F_est=19.3N）。
+
+### 原理（250Hz 每 tick）
+
+```
+τ = Jᵀ[ Kx∘Δx ; Kr∘Δθ ] + Jᵀ[ −Dx∘ẋ ; −Dr∘ω ] + Nᵀ(Kq∘(q_post−q) − Dq∘q̇) − KD_J∘q̇ + G(q)
+    └──── 弹簧(soft-stop可衰减) ────┘ └──── 阻尼(受采样稳定上限保护) ────┘  关节阻尼  重力(走§14路径)
+MITParam(kp=0, kd=IMP_KD, 0, 0, τ)   # 纯力矩 + 电机侧阻尼兜底（零力矩模式的已验证路径）
+```
+
+- J = `jacobian6(q, LOCAL_WORLD_ALIGNED)` 世界系；Δθ = log3(R_des Rᵀ)；ẋ = J·q̇（电机速度反馈，30Hz 低通）
+- Dx = 2ζ√(Kx·m̂)（m̂=2kg），Dr = 2ζ√(Kr·Ĩ)（Ĩ=0.05）—— ζ 一个旋钮管全部阻尼
+- **阻尼采样稳定上限**：`|τ_damp,i| ≤ 0.3·I_i/dt`（I_i=关节惯量对角，锚点时刻 crba 算出）。
+  腕关节惯量仅 ~0.003 kg·m²，ZOH 阻尼 kd·h/I≥2 会发散——此上限构造性保证稳定
+  （曾实测：无上限时腕部 13 rad/s 自持振荡）。弹簧项不受限（只决定平衡位置）。
+
+### UI（每臂阻抗卡片）
+
+开关 | 预设（软/中/硬）| Kx 滑条 100–2000 | ζ 滑条 0.5–1.5 | 漏速滑条 0–2/s | 推20N·1s（sim 虚拟推力）
+读数：Δx(mm, 前/左/上 + 主方向)、Δθ(°)、F_est(N)、q̇max。滑条范围即安全范围。
+
+| 预设 | Kx (N/m) | Kr (Nm/rad) | 手感 |
+|------|----------|-------------|------|
+| 软 | 300 | 8 | 拖得动、轻回中 |
+| 中 | 800 | 20 | 默认 |
+| 硬 | 1500 | 40 | 接近刚性 |
+
+### 与其它功能的关系
+
+- **与重力补偿**：不冲突且相互需要——阻抗模块不含重力项，G(q) 继续走 §14 的
+  `_grav_tau()` 路径；开阻抗自动把重力 scale 提到 ≥1.0（否则弹簧扛自重、手感失真）。
+- **模式**：独立模式 `IMPEDANCE`，从 抱住/零力矩 都能开（切换力矩连续无跳变）；
+  运动请求（归零/到终点/直线/弧线）会自动退出阻抗→电机侧 PD→再执行。
+- **在线调参**：滑条实时生效，不重置锚点；重新勾选开关才重新锚定。
+- **退出**：取消勾选 → 抱住当前位姿；失能 → 掉电（重力同关）。
+
+### 安全
+
+‖Δx‖≤10cm、‖Δθ‖≤0.5rad 钳位；τ 按 TMAX 钳位；计算超时(>8ms)/异常 → 自动抱住；
+q̇>3rad/s 只衰减弹簧（阻尼不衰减）；过热保护沿用。**实机阶梯**：手扶臂 → 软档 →
+ζ=1.0 → 逐级加硬；一次一臂，另一臂抱住；先演练急停（失能）。
+
+### 验证记录（sim, pinocchio aba 被控对象 + 虚拟推力）
+
+- 静置保持 1.4–2.4mm；软档推 20N 峰值 64mm（理论 F/Kx=67mm）、回弹 <5mm；
+  硬档推 40N 峰值 30mm（理论 27mm）；漏速 1.0 拖动偏差 4mm 且跟随。
+- 归零奇异位直接开阻抗：稳定（振荡修复前 13 rad/s，修复后 <2 rad/s 暂态）。
+- 实机 tick 计算耗时 0.17ms（p99 0.21ms），250Hz 预算 4ms 占 4%。
+- `web_panel --sim` + HTTP `POST /impedance {push:[20,0,0],dur:1}` 可无浏览器复测。
+
+### HTTP 接口
+
+`POST /impedance` — `{side, on, preset, kx, zeta, leak}` 或 `{side, push:[fx,fy,fz], dur}`
+（push 仅 sim）。快照每臂新增 `imp` 字段（on/preset/kx/zeta/leak/dx/dth/fest/qdot）。

@@ -18,6 +18,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import json
+import os
+import socket
 import sys
 import threading
 import time
@@ -57,6 +60,8 @@ MODE_ACTIONS = {"enable": ArmMode.ZERO_TORQUE, "hold": ArmMode.ENABLED_HOLD,
 STREAM_HZ = 20.0
 
 # module-level backend handles (set in main / lifespan)
+_HOST, _PORT = "0.0.0.0", 8050
+_LOG_DIR: Path | None = None
 rs: RobotState | None = None
 buf: DataBuffer | None = None
 controllers: dict[str, ArmController] = {}
@@ -255,6 +260,7 @@ def _snapshot() -> dict:
             "err": err,
             "grav_on": c.gravity_on if c else False,
             "grav_scale": round(float(c.grav_scale), 2) if c else 0.0,
+            "imp": c.imp_state() if c else None,
         }
     return out
 
@@ -295,6 +301,7 @@ def _ok(ok=True, **kw):
 @app.post("/mode")
 async def _mode(req: Request):
     b = await req.json()
+    _cmd_log("/mode", b)
     side, action = b.get("side"), b.get("action")
     if side not in SIDES or action not in MODE_ACTIONS:
         return _ok(False, err="bad args")
@@ -305,6 +312,7 @@ async def _mode(req: Request):
 @app.post("/teach")
 async def _teach(req: Request):
     b = await req.json()
+    _cmd_log("/teach", b)
     side, which = b.get("side"), b.get("which")
     if side not in SIDES or which not in ("start", "end"):
         return _ok(False, err="bad args")
@@ -317,6 +325,7 @@ async def _action(req: Request):
     """One-shot buttons: go_start | go_end | line_run | arc_add | arc_clear |
     arc_start | arc_run | replay_run | bspline_run."""
     b = await req.json()
+    _cmd_log("/action", b)
     side, op = b.get("side"), b.get("op")
     if side not in SIDES or not op:
         return _ok(False, err="bad args")
@@ -348,6 +357,7 @@ async def _action(req: Request):
 @app.post("/tune")
 async def _tune(req: Request):
     b = await req.json()
+    _cmd_log("/tune", b)
     try:
         if isinstance(b.get("slowdown"), (int, float)) and b["slowdown"] > 0:
             ARC_TUNE["slowdown"] = float(b["slowdown"])
@@ -368,10 +378,32 @@ async def _tune(req: Request):
 async def _gravity(req: Request):
     """Toggle gravity comp + set scale (0..1.5). Effective only when enabled."""
     b = await req.json()
+    _cmd_log("/gravity", b)
     side = b.get("side")
     if side not in SIDES:
         return _ok(False, err="bad side")
     controllers[side].set_gravity(bool(b.get("on", False)), b.get("scale", 0.0))
+    return _ok()
+
+
+@app.post("/impedance")
+async def _impedance(req: Request):
+    """Cartesian impedance: {on, preset(soft|mid|stiff), kx, zeta, leak} or
+    {push:[fx,fy,fz], dur} for a virtual EE push (sim verification only)."""
+    b = await req.json()
+    _cmd_log("/impedance", b)
+    side = b.get("side")
+    if side not in SIDES:
+        return _ok(False, err="bad side")
+    c = controllers[side]
+    if "push" in b:
+        try:
+            c.request_imp_push(b["push"], float(b.get("dur", 1.0)))
+        except (TypeError, ValueError) as e:
+            return _ok(False, err=str(e))
+        return _ok()
+    params = {k: b[k] for k in ("preset", "kx", "zeta", "leak") if b.get(k) is not None}
+    c.request_impedance(bool(b.get("on", False)), params)
     return _ok()
 
 
@@ -380,17 +412,130 @@ def _json_dumps(obj):
     return json.dumps(obj, separators=(",", ":"))
 
 
+# ============================================================ debug logging
+def _workspace_root() -> Path:
+    p = Path(__file__).resolve()
+    for par in p.parents:
+        if (par / "install").is_dir() and (par / "src").is_dir():
+            return par
+    return p.parents[3]
+
+
+def _setup_logging(sim: bool, can_slot: int, log_dir: str | None) -> Path:
+    """Create log/panel_<ts>/ with panel.log + commands.jsonl; tee rs.log to disk."""
+    global _LOG_DIR
+    root = Path(log_dir) if log_dir else _workspace_root() / "log"
+    d = root / time.strftime("panel_%Y%m%d_%H%M%S")
+    d.mkdir(parents=True, exist_ok=True)
+    _LOG_DIR = d
+    panel_f = (d / "panel.log").open("a")
+
+    def tee(line: str) -> None:   # rs.log hook — must never raise
+        try:
+            panel_f.write(time.strftime("%Y-%m-%d ") + line + "\n")
+            panel_f.flush()
+        except OSError:  # noqa: BLE001
+            pass
+
+    rs.add_log_hook(tee)
+    key = ["web_panel.py", "arm_controller.py", "impedance.py", "gravity.py"]
+    banner = [
+        f"panel start {time.strftime('%Y-%m-%d %H:%M:%S')} host={socket.gethostname()}",
+        f"sim={sim} can_slot={can_slot} can_map={CAN_MAP}",
+        "file mtimes: " + ", ".join(
+            f"{n}={time.strftime('%H:%M:%S', time.localtime(os.path.getmtime(Path(__file__).parent / n)))}"
+            for n in key),
+        f"log dir: {d}",
+    ]
+    for b in banner:
+        print(f"[panel] {b}", flush=True)
+        tee(b)
+    _cmd_log("_start", {"sim": sim, "can_slot": can_slot})
+    return d
+
+
+def _cmd_log(ep: str, body: dict) -> None:
+    """Append one HTTP command to commands.jsonl (what was clicked, when)."""
+    if _LOG_DIR is None:
+        return
+    try:
+        with (_LOG_DIR / "commands.jsonl").open("a") as f:
+            f.write(json.dumps({"t": round(time.time(), 3), "ep": ep, "body": body},
+                               ensure_ascii=False) + "\n")
+    except OSError:  # noqa: BLE001
+        pass
+
+
+def _can_sampler(ifaces: list[str], out: Path) -> None:
+    """5 s CAN error/byte counters — catches CAN drops mid-test."""
+    while True:
+        try:
+            row = {"t": round(time.time(), 1)}
+            for i in ifaces:
+                d = Path(f"/sys/class/net/{i}/statistics")
+                def g(n):  # noqa: E306
+                    try:
+                        return int((d / n).read_text().strip())
+                    except Exception:  # noqa: BLE001
+                        return -1
+                row[i] = {k: g(k) for k in ("rx_bytes", "tx_bytes", "rx_errors",
+                                            "tx_errors", "rx_dropped", "tx_dropped")}
+            with out.open("a") as f:
+                f.write(json.dumps(row) + "\n")
+        except OSError:  # noqa: BLE001
+            pass
+        time.sleep(5.0)
+
+
 # ============================================================ main
-def _bringup(sim, can_slot, no_can):
+def _realtime_hygiene() -> None:
+    """Kill the two main sources of random multi-ms stalls in the 250 Hz loop:
+    1. OpenBLAS thread pool: SVD/solve spin-sync across cores; when the SSE /
+       recorder / other arm's threads contend, a solve can stall 5-15 ms.
+       Single-threaded BLAS on a 6x7 matrix costs ~0.015ms and never stalls.
+    2. Python cyclic GC: gen2 collections over the 250 Hz allocation churn
+       pause the world for ms at random moments -> freeze the threshold so
+       collections stop (refcounting still frees everything we allocate).
+
+    NOTE: setting OPENBLAS_NUM_THREADS here is NOT enough — numpy is already
+    imported (module top) and OpenBLAS sized its pool at load (8 threads).
+    threadpoolctl.threadpool_limits() re-caps the LIVE pool, which works
+    regardless of import order. Env vars are kept as belt-and-braces for any
+    library that reads them lazily."""
+    for v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS",
+              "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ[v] = "1"
+    try:
+        import threadpoolctl
+        # create a BLAS workload first so the pool exists, then cap it for
+        # the whole process lifetime (context-manager-free global limit)
+        np.linalg.svd(np.random.rand(6, 7), compute_uv=False)
+        threadpoolctl.threadpool_limits(1)
+    except ImportError:
+        print("[panel] WARN: threadpoolctl missing — OpenBLAS may stay "
+              "multi-threaded; expect occasional >8ms ticks", flush=True)
+    import gc
+    gc.freeze()
+    gc.disable()
+
+
+def _bringup(sim, can_slot, no_can, log_dir=None):
     global rs, buf, CAN_MAP
     rs = RobotState(SIDES)
     buf = DataBuffer(SIDES, maxlen=400)
     CAN_MAP = {"left": f"can_slot{can_slot}_ch0", "right": f"can_slot{can_slot}_ch1"}
+    log_dir = _setup_logging(sim, can_slot, log_dir)
+    if not sim:
+        threading.Thread(target=_can_sampler,
+                         args=(list(CAN_MAP.values()), log_dir / "can_stats.jsonl"),
+                         daemon=True, name="can-sampler").start()
     for side in SIDES:
         try:
             models[side] = PinocchioModel(resolve_urdf_path(), side)
+            print(f"[panel] {side}: pinocchio model OK", flush=True)
         except Exception as e:  # noqa: BLE001
             rs.log(f"{side}: 模型加载失败: {e}")
+            print(f"[panel] {side}: model FAILED: {type(e).__name__}: {e}", flush=True)
     for side in SIDES:
         if sim:
             iface = f"sim-{side}"
@@ -401,16 +546,28 @@ def _bringup(sim, can_slot, no_can):
                 up = bringup_can(iface)
                 rs.set_can(iface, up)
                 rs.log(f"{side} CAN {iface}: {'UP' if up else 'FAILED'}")
+                print(f"[panel] {side} CAN {iface}: {'UP' if up else 'FAILED'}", flush=True)
             else:
                 rs.set_can(iface, can_is_up(iface))
+        print(f"[panel] {side}: opening {iface} (sim={sim}) ...", flush=True)
         try:
-            c = ArmController(iface, side, rs, buf, sim=sim)
+            c = ArmController(iface, side, rs, buf, sim=sim,
+                              record_dir=str(log_dir))
             c.start()
             controllers[side] = c
             c.request_transition(ArmMode.ZERO_TORQUE)
+            print(f"[panel] {side}: controller up, zero-torque", flush=True)
         except Exception as e:  # noqa: BLE001
             rs.log(f"{side}: init failed: {type(e).__name__}: {e}")
+            print(f"[panel] {side}: init FAILED: {type(e).__name__}: {e}", flush=True)
     rs.log("web panel ready — both arms zero-torque (safe)")
+    print("[panel] bringup done — starting HTTP server ...", flush=True)
+
+
+@app.on_event("startup")
+def _startup():
+    print(f"[panel] ▶ READY — http://{_HOST}:{_PORT}  (SSE ~{STREAM_HZ:.0f}Hz, "
+          f"both arms zero-torque)", flush=True)
 
 
 @app.on_event("shutdown")
@@ -421,15 +578,19 @@ def _shutdown():
 
 
 def main() -> int:
-    global CAN_MAP
+    global CAN_MAP, _HOST, _PORT
     ap = argparse.ArgumentParser()
     ap.add_argument("--sim", action="store_true")
     ap.add_argument("--port", type=int, default=8050)
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--no-can", action="store_true")
     ap.add_argument("--can-slot", type=int, default=1)
+    ap.add_argument("--log-dir", default=None,
+                    help="log root (default: <workspace>/log)")
     args = ap.parse_args()
-    _bringup(args.sim, args.can_slot, args.no_can)
+    _HOST, _PORT = args.host, args.port
+    _realtime_hygiene()
+    _bringup(args.sim, args.can_slot, args.no_can, args.log_dir)
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 

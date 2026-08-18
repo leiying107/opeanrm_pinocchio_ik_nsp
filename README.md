@@ -19,8 +19,19 @@ This repository combines two workspaces:
   Pinocchio. Avoids the home-singularity failure that KDL (MoveIt's default) hits.
 - **Planners**: Cartesian line, arc (circular fit), pose-replay, B-spline; with
   rest-to-rest quintic ease + per-joint velocity cap; warn-only smoothness check.
-- **Dashboard** (`openarm_nsp_ws/src/openarm_dashboard`): Dash web UI driving the
-  arms over direct CAN (`openarm_can`), 250 Hz worker, teach/line/arc/replay.
+- **Dashboard** (`openarm_nsp_ws/src/openarm_dashboard`): FastAPI+SSE web UI
+  driving the arms over direct CAN (`openarm_can`), 250 Hz worker,
+  teach/line/arc/replay, gravity compensation.
+- **Cartesian impedance control** (`openarm_dashboard/.../impedance.py`): 6-D
+  spring-damper at the EE, `τ = Jᵀ(K·Δx − D·ẋ) + Nᵀ(Kq·Δq − Dq·q̇) + G(q)` on
+  the pure-torque MIT path; presets 极软/软/中/硬, drag "leak" mode, σ_min
+  singularity guard (entry gate / soft escape / hard exit), per-joint damping
+  stability cap, 2 s ramp-in, 250 Hz debug logging (`log/panel_<ts>/`).
+  Real-hw validated through four logged incident post-mortems — docs:
+  [`IMPEDANCE_THEORY.md`](./openarm_nsp_ws/IMPEDANCE_THEORY.md),
+  [`IMPEDANCE_SAFETY.md`](./openarm_nsp_ws/IMPEDANCE_SAFETY.md); sim test
+  suite: `src/openarm_dashboard/scripts/test_impedance_sim.py` (6 tests,
+  headless).
 - **MoveIt panel** (`openarm_pinocchio_ik/moveit_web/moveit_web_panel.py`): a pure
   `move_group` client (Dash) to interactively test OpenArm's *native* MoveIt
   (plan/execute named/joint/pose goals, show planning time / error / trajectory).

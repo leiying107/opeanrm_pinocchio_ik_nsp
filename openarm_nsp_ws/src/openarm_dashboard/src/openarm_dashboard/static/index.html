@@ -41,9 +41,15 @@
   .b-go_start{background:var(--cyn)}.b-go_end{background:var(--pnk)}.b-line_run{background:#e85a2c}
   .b-arc_add{background:var(--brn)}.b-arc_clear{background:var(--gry)}
   .b-arc_start{background:var(--cyn)}.b-arc_run{background:var(--pur)}.b-replay_run{background:var(--teal)}.b-bspline_run{background:var(--ind)}
-  .grav{display:flex;align-items:center;gap:8px;margin:4px 0 2px;font-size:13px}
+  .grav{display:flex;align-items:center;gap:8px;margin:4px 0 2px;font-size:13px;flex-wrap:wrap}
   .grav input[type=checkbox]{width:16px;height:16px}
   .grav input[type=range]{width:130px;accent-color:#ffb74d}
+  .imp{display:flex;align-items:center;gap:7px;margin:4px 0 2px;font-size:13px;flex-wrap:wrap}
+  .imp input[type=checkbox]{width:16px;height:16px}
+  .imp input[type=range]{width:90px;accent-color:#7e57c2}
+  .imp select{background:#0d1117;color:var(--tx);border:1px solid var(--line);border-radius:4px;padding:2px 4px}
+  .imp .lbl{color:var(--mut);font-size:12px}
+  .b-imp_push{background:#5e35b1;padding:5px 9px;font-size:12px}
   .mut{color:var(--mut);font-variant-numeric:tabular-nums;min-width:28px}
   .errtxt{font:11px/1.45 ui-monospace,monospace;color:#cfe3ff;background:#0c0f14;border:1px solid var(--line);
           border-radius:5px;padding:5px 7px;margin:4px 0 6px;white-space:pre-wrap;min-height:30px}
@@ -96,6 +102,13 @@ for(const s of SIDES){
     <div class="grav"><label><input type="checkbox" id="gv-${s}"> 重力补偿</label>
       <input type="range" id="gs-${s}" min="0" max="1" step="0.05" value="0">
       <span class="mut" id="gl-${s}">0.00</span></div>
+    <div class="imp"><label><input type="checkbox" id="ip-${s}"> 阻抗</label>
+      <select id="ipp-${s}"><option value="ultra" selected>极软</option><option value="soft">软</option><option value="mid">中</option><option value="stiff">硬</option></select>
+      <span class="lbl">Kx</span><input type="range" id="ipk-${s}" min="100" max="2000" step="50" value="100"><span class="mut" id="ipkv-${s}">100</span>
+      <span class="lbl">ζ</span><input type="range" id="ipz-${s}" min="0.5" max="1.5" step="0.05" value="1"><span class="mut" id="ipzv-${s}">1.00</span>
+      <span class="lbl">漏速</span><input type="range" id="ipl-${s}" min="0" max="2" step="0.05" value="0"><span class="mut" id="iplv-${s}">0.00</span>
+      <button id="ippush-${s}" class="b-imp_push">推20N·1s</button></div>
+    <pre class="errtxt" id="imptxt-${s}">（使能后开阻抗：末端弹簧-阻尼，可推动回弹；漏速>0 变柔顺拖动）</pre>
     <div class="ctitle">关节位置 (rad, 最近${(HIST/20).toFixed(0)}s)</div>
     <canvas id="cj-${s}" height="150"></canvas>
     <div class="ctitle">IK 跟踪误差 (mm / °) — 运动后保持稳态</div>
@@ -183,6 +196,17 @@ function fmtErr(e){
          `姿态 ${e.omag}°  (R${sgn(r)} P${sgn(p)} Y${sgn(y)}) → ${oa[0]} ${Math.abs(oa[1]).toFixed(2)}°`;
 }
 
+// ---- impedance readout (Δx world: x前 y左 z上; F_est = K·Δx) ----
+function fmtImp(imp){
+  const head=`阻抗ON [${{ultra:"极软",soft:"软",mid:"中",stiff:"硬"}[imp.preset]}] Kx=${imp.kx}N/m ζ=${imp.zeta.toFixed(2)} 漏速${imp.leak.toFixed(2)}/s${imp.ramp!=null&&imp.ramp<1?` 渐入${Math.round(imp.ramp*100)}%`:""}`;
+  if(!imp.dx) return head+"\n（等待数据…）";
+  const [dx,dy,dz]=imp.dx,[r,p,y]=imp.dth,f=imp.fest;
+  const pm=Math.hypot(dx,dy,dz),fm=Math.hypot(f[0],f[1],f[2]);
+  const pa=[["前","后",dx],["左","右",dy],["上","下",dz]].sort((a,b)=>Math.abs(b[2])-Math.abs(a[2]))[0];
+  return head+`\nΔx ${pm.toFixed(1)}mm (前${sgn(dx)} 左${sgn(dy)} 上${sgn(dz)}) → 偏${pa[2]>=0?pa[0]:pa[1]} ${Math.abs(pa[2]).toFixed(1)}mm | F≈${fm.toFixed(1)}N\n`+
+         `Δθ ${Math.hypot(r,p,y).toFixed(2)}° (R${sgn(r,2)} P${sgn(p,2)} Y${sgn(y,2)}) | q̇max ${imp.qdot}rad/s | σ ${imp.sigma!=null?imp.sigma.toFixed(3):"—"}${imp.sigma!=null&&imp.sigma<0.05?" ⚠奇异":""}`;
+}
+
 // ---- render an SSE snapshot ----
 function render(snap){
   for(const s of SIDES){
@@ -196,6 +220,20 @@ function render(snap){
     if(gv){gv.checked=!!a.grav_on;gv.disabled=!a.enabled;}
     if(gs&&document.activeElement!==gs)gs.value=a.grav_scale;
     if(gl)gl.textContent=(a.grav_scale||0).toFixed(2);
+    const imp=a.imp, it=document.getElementById("imptxt-"+s);
+    if(imp){
+      const cb=document.getElementById("ip-"+s);
+      if(cb){cb.checked=!!imp.on;cb.disabled=false;}
+      setIf("ipp-"+s,imp.on?imp.preset:undefined);
+      if(!imp.on){imp.kx=parseFloat(document.getElementById("ipk-"+s).value);imp.zeta=parseFloat(document.getElementById("ipz-"+s).value);imp.leak=parseFloat(document.getElementById("ipl-"+s).value);}
+      if(document.activeElement!==document.getElementById("ipk-"+s))setIf("ipk-"+s,imp.kx);
+      if(document.activeElement!==document.getElementById("ipz-"+s))setIf("ipz-"+s,imp.zeta);
+      if(document.activeElement!==document.getElementById("ipl-"+s))setIf("ipl-"+s,imp.leak);
+      document.getElementById("ipkv-"+s).textContent=imp.kx;
+      document.getElementById("ipzv-"+s).textContent=imp.zeta.toFixed(2);
+      document.getElementById("iplv-"+s).textContent=imp.leak.toFixed(2);
+      if(it)it.textContent=imp.on?fmtImp(imp):"（使能后开阻抗：末端弹簧-阻尼，可推动回弹；漏速>0 变柔顺拖动）";
+    } else if(it){it.textContent="（阻抗模型不可用）";const cb=document.getElementById("ip-"+s);if(cb)cb.disabled=true;}
     jointHist[s].push(a.joints);if(jointHist[s].length>HIST)jointHist[s].shift();
     if(a.err){
       errHist[s].push([a.err.pmag,a.err.omag]); if(errHist[s].length>HIST) errHist[s].shift();
@@ -238,6 +276,23 @@ for(const s of SIDES){
   gs.addEventListener("input",()=>{document.getElementById("gl-"+s).textContent=parseFloat(gs.value).toFixed(2);clearTimeout(gt);gt=setTimeout(()=>sendGrav(s),150);});
 }
 function sendGrav(s){post("/gravity",{side:s,on:document.getElementById("gv-"+s).checked,scale:parseFloat(document.getElementById("gs-"+s).value)});}
+// impedance controls (checkbox toggles; sliders/select live-retune while ON)
+function sendImp(s){post("/impedance",{side:s,on:document.getElementById("ip-"+s).checked,
+  preset:document.getElementById("ipp-"+s).value,
+  kx:parseFloat(document.getElementById("ipk-"+s).value),
+  zeta:parseFloat(document.getElementById("ipz-"+s).value),
+  leak:parseFloat(document.getElementById("ipl-"+s).value)});}
+for(const s of SIDES){
+  document.getElementById("ip-"+s).addEventListener("change",()=>sendImp(s));
+  document.getElementById("ipp-"+s).addEventListener("change",()=>{if(document.getElementById("ip-"+s).checked)sendImp(s);});
+  const impDeb={};
+  for(const[id,lab,fix] of [["ipk","ipkv",0],["ipz","ipzv",2],["ipl","iplv",2]]){
+    const el=document.getElementById(id+"-"+s);
+    el.addEventListener("input",()=>{document.getElementById(lab+"-"+s).textContent=parseFloat(el.value).toFixed(fix);
+      clearTimeout(impDeb[id]);impDeb[id]=setTimeout(()=>{if(document.getElementById("ip-"+s).checked)sendImp(s);},200);});
+  }
+  document.getElementById("ippush-"+s).addEventListener("click",()=>post("/impedance",{side:s,push:[20,0,0],dur:1.0}));
+}
 
 // ---- SSE connect with reconnect + staleness pill ----
 let lastTick=0,backoff=1000;

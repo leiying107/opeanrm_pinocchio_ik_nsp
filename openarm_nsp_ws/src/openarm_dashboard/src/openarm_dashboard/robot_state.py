@@ -42,6 +42,12 @@ class RobotState:
         self.arms: dict[str, ArmSnapshot] = {s: ArmSnapshot() for s in sides}
         self.can_up: dict[str, bool] = {}      # iface -> up
         self.messages: deque[str] = deque(maxlen=200)
+        self._log_hooks: list = []             # callbacks(line) — e.g. file tees
+
+    def add_log_hook(self, fn) -> None:
+        """Register fn(full_line) called for every log message (file tees).
+        Called OUTSIDE the lock; fn must be fast / non-blocking."""
+        self._log_hooks.append(fn)
 
     def update_arm(self, side: str, **fields) -> None:
         with self._lock:
@@ -63,7 +69,13 @@ class RobotState:
     def log(self, msg: str) -> None:
         stamp = time.strftime("%H:%M:%S")
         with self._lock:
-            self.messages.append(f"[{stamp}] {msg}")
+            line = f"[{stamp}] {msg}"
+            self.messages.append(line)
+        for fn in self._log_hooks:
+            try:
+                fn(line)
+            except Exception:  # noqa: BLE001 — a log tee must never break control
+                pass
 
     def snapshot(self, side: str) -> ArmSnapshot:
         with self._lock:
