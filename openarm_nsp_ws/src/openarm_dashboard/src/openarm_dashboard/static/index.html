@@ -30,10 +30,18 @@
   .ctitle{color:var(--mut);font-size:12px;margin:8px 0 3px}
   .btns{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
   .btns .grp{display:flex;flex-wrap:wrap;gap:6px;padding-bottom:6px;border-bottom:1px dashed var(--line);width:100%}
+  /* trajectory card rows: reuse the .grp flex row look but scoped to .traj,
+     plus the dropdown/select styling the .imp scope already has */
+  .traj .grp{display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding:3px 0}
+  .traj select{background:#0d1117;color:var(--tx);border:1px solid var(--line);
+               border-radius:4px;padding:4px 6px;max-width:240px}
+  .traj .lbl{color:var(--mut);font-size:12px}
+  .traj input[type=range]{width:80px;accent-color:#00897b}
   .btns .grp:last-child{border-bottom:0}
   button{border:0;border-radius:6px;color:#fff;padding:8px 11px;font-size:13px;cursor:pointer;opacity:.92}
   button:hover{filter:brightness(1.08)}
-  button:disabled{opacity:.32;cursor:not-allowed}
+  button:disabled{opacity:.45;cursor:not-allowed;filter:saturate(.4)}
+  button:disabled:hover{filter:none}
   .log{margin:0 14px 14px;background:#0c0f14;border:1px solid var(--line);border-radius:8px;padding:8px 10px;
        height:140px;overflow:auto;font:11px/1.45 ui-monospace,monospace;color:#9fb0c7;white-space:pre-wrap}
   .b-enable{background:var(--grn)}.b-hold{background:var(--blu)}.b-home{background:var(--org)}.b-disable{background:var(--red)}
@@ -50,6 +58,15 @@
   .imp select{background:#0d1117;color:var(--tx);border:1px solid var(--line);border-radius:4px;padding:2px 4px}
   .imp .lbl{color:var(--mut);font-size:12px}
   .b-imp_push{background:#5e35b1;padding:5px 9px;font-size:12px}
+  /* trajectory card buttons — explicit colors (the generic button style has
+     no background, so browsers render an OS-gray default that vanishes on
+     the dark card; hw feedback 2026-08-21) */
+  .b-tr_rec{background:var(--red);padding:6px 10px}
+  .b-tr_stop{background:#8e24aa;padding:6px 10px}
+  .b-tr_load{background:var(--gry);padding:6px 10px}
+  .b-tr_home{background:#00897b;padding:6px 10px}
+  .b-tr_play{background:var(--grn);padding:6px 10px;font-weight:600}
+  .b-tr_halt{background:#e65100;padding:6px 10px;font-weight:600}
   .mut{color:var(--mut);font-variant-numeric:tabular-nums;min-width:28px}
   .errtxt{font:11px/1.45 ui-monospace,monospace;color:#cfe3ff;background:#0c0f14;border:1px solid var(--line);
           border-radius:5px;padding:5px 7px;margin:4px 0 6px;white-space:pre-wrap;min-height:30px}
@@ -60,6 +77,8 @@
   <h2>OpenArm Hardware Panel</h2>
   <span class="pill" id="livepill">live: connecting…</span>
   <span id="canbar"></span>
+  <label style="margin-left:auto;font-size:13px;cursor:pointer"><input type="checkbox" id="col-on" checked style="width:15px;height:15px;vertical-align:-2px"> 自碰撞</label>
+  <span id="colflag" style="font-size:13px;font-weight:bold"></span>
 </header>
 
 <div class="tune">
@@ -285,6 +304,16 @@ function render(snap){
     updateButtons(s,a);
   }
   document.getElementById("canbar").textContent="CAN: "+SIDES.map(s=>`${s} ${snap.arms[s].can_up?"✓UP":"✗DOWN"}`).join("  |  ");
+  // collision gate status
+  const col=snap.col||{};
+  const cOn=document.getElementById("col-on");
+  if(cOn&&document.activeElement!==cOn)cOn.checked=!!col.on;
+  const cf=document.getElementById("colflag");
+  if(cf){
+    if(col.hit){cf.textContent="⛔间距<20mm: "+(col.pair||"");cf.style.color="#ff6b6b";}
+    else if(col.on){cf.textContent="";cf.style.color="";}
+    else{cf.textContent="";cf.style.color="";}
+  }
   // tune sync
   const t=snap.tune||{};setIf("t-slowdown",t.slowdown);setIf("t-cap",t.cap);setIf("t-maxspeed",t.maxspeed);setIf("t-freq",t.freq);
   const m=t.mode;document.querySelectorAll('input[name=mode]').forEach(r=>{r.checked=(r.value===m);});
@@ -294,6 +323,8 @@ function setIf(id,v){if(v!=null){const e=document.getElementById(id);if(e&&docum
 
 // ---- actions ----
 async function post(url,body){try{await fetch(url,{method:"POST",headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});}catch(e){}}
+// self-collision master switch
+document.getElementById("col-on")?.addEventListener("change",e=>post("/collision",{on:e.target.checked}));
 function onClick(s,el){
   if(el.tagName!=="BUTTON")return;const b=el.dataset.b;if(!b||el.disabled)return;
   if(MODE.includes(b))post("/mode",{side:s,action:b});
