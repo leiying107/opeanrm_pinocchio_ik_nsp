@@ -63,9 +63,12 @@ class ArmMode(enum.Enum):
     GO_END = "GO_END"
     TRACKING = "TRACKING"
     IMPEDANCE = "IMPEDANCE"   # Cartesian 6D spring-damper at the EE
+    IMP_TRACK = "IMP_TRACK"   # impedance playback: anchor follows a recorded
+                              # trajectory; external push pauses the clock
 
 
-_BUSY = {ArmMode.HOMING, ArmMode.GO_START, ArmMode.GO_END, ArmMode.TRACKING}
+_BUSY = {ArmMode.HOMING, ArmMode.GO_START, ArmMode.GO_END, ArmMode.TRACKING,
+         ArmMode.IMP_TRACK}
 
 
 def bringup_can(iface: str) -> bool:
@@ -136,6 +139,7 @@ class ArmController:
         self._move_target = np.zeros(ARM_DOF)
         self._move_start = np.zeros(ARM_DOF)
         self._move_t0 = 0.0
+        self._move_dur = MOVE_DUR
         # tracking trajectory
         self._traj: tuple[list[float], list[np.ndarray]] | None = None
         self._traj_t0 = 0.0
@@ -177,6 +181,16 @@ class ArmController:
         self._last_actual_tau = np.zeros(ARM_DOF)
         self._imp_tau_res = np.zeros(ARM_DOF)   # LPF'd tau_sensed - tau_cmd
         self._imp_push_ct = 0
+        # trajectory record / impedance playback (traj_rec.py)
+        self._trec = None              # TrajRecorder while recording
+        self._trec_t0 = 0.0
+        self._trec_last = 0.0          # last 50Hz sample time
+        self._traj = None              # loaded TrajData
+        self._traj_name = ""
+        self._tplay = 0.0              # replay clock (trajectory seconds)
+        self._tpaused = False
+        self._tresume_ct = 0
+        self._trate = 0.5              # rate multiplier (UI)
         self._imp_lower = np.full(ARM_DOF, -3.05)
         self._imp_upper = np.full(ARM_DOF, 3.05)
         try:
@@ -334,6 +348,11 @@ class ArmController:
         self._q.put(("imp_push", force3, dur))
         return True
 
+    def request_traj(self, op: str, payload: dict | None = None) -> bool:
+        """Trajectory record/replay ops (see _do_traj)."""
+        self._q.put(("traj", op, dict(payload or {})))
+        return True
+
     # ------------------------------------------------- worker
     def _work_loop(self) -> None:
         rate = 0.05 if self.sim else 0.004
@@ -357,6 +376,8 @@ class ArmController:
                             self._do_impedance(cmd[1], cmd[2])
                         elif cmd[0] == "imp_push":
                             self._do_imp_push(cmd[1], cmd[2])
+                        elif cmd[0] == "traj":
+                            self._do_traj(cmd[1], cmd[2])
                     except Exception as e:  # noqa: BLE001
                         msg = f"{self.side}: cmd error {type(e).__name__}: {e}"
                         print(msg, flush=True)
@@ -371,7 +392,7 @@ class ArmController:
                 self.rs.log(msg)
                 # a failed tick in IMPEDANCE means NO torque frame went out —
                 # never keep the mode alive on a broken loop; drop to PD hold
-                if self.mode == ArmMode.IMPEDANCE:
+                if self.mode in (ArmMode.IMPEDANCE, ArmMode.IMP_TRACK):
                     try:
                         self._exit_impedance(f"loop error {type(e).__name__} → 抱住")
                     except Exception:  # noqa: BLE001 - last resort
@@ -460,6 +481,174 @@ class ArmController:
         self.rs.log(f"{self.side}: 虚拟推力 {np.round(np.asarray(force3, float), 1).tolist()}N "
                     f"× {dur:.1f}s")
 
+    # ------------------------------------------------------ trajectory ops
+    def _do_traj(self, op: str, p: dict) -> None:
+        """record_start/record_stop/load/replay/stop/home (traj_rec.py)."""
+        from . import traj_rec
+        if op == "record_start":
+            if self.mode != ArmMode.ZERO_TORQUE or not self.enabled:
+                self.rs.log(f"{self.side}: 录制需先使能+零力矩（当前 {self.mode.value}）")
+                return
+            self._trec = traj_rec.TrajRecorder()
+            self._trec.start(self._read_pos())
+            self._trec_last = time.monotonic()
+            self._trec_t0 = time.time()
+            self.rs.log(f"{self.side}: 轨迹录制开始（拖动机械臂，最长120s）")
+        elif op == "record_stop":
+            if self._trec is None:
+                self.rs.log(f"{self.side}: 未在录制")
+                return
+            try:
+                self._traj = self._trec.stop()
+                self._traj.side = self.side
+                path = self._traj.save(p.get("name", ""), self.side)
+                self._traj_name = path.name
+                self.rs.log(f"{self.side}: 录制完成 {self._traj.times[-1]:.1f}s "
+                            f"{len(self._traj.times)}点 → {path.name}")
+            except ValueError as e:
+                self.rs.log(f"{self.side}: 录制失败: {e}")
+            finally:
+                self._trec = None
+        elif op == "load":
+            try:
+                self._traj = traj_rec.TrajData.load(
+                    traj_rec.TRAJ_DIR / p["name"])
+                if self._traj.side and self._traj.side != self.side:
+                    self.rs.log(f"{self.side}: 轨迹属于{self._traj.side}臂，已拒载")
+                    self._traj = None
+                    return
+                self._traj_name = p["name"]
+                self.rs.log(f"{self.side}: 已加载 {p['name']} "
+                            f"({self._traj.times[-1]:.1f}s)")
+            except (KeyError, ValueError, OSError) as e:
+                self.rs.log(f"{self.side}: 加载失败: {e}")
+        elif op == "replay":
+            self._begin_imp_track(p)
+        elif op == "stop":
+            if self.mode == ArmMode.IMP_TRACK:
+                self._exit_impedance("轨迹回放停止 → 抱住")
+            elif self._trec is not None:
+                self._trec = None
+                self.rs.log(f"{self.side}: 录制已取消")
+        elif op == "home":
+            if self._traj is None:
+                self.rs.log(f"{self.side}: 先加载轨迹")
+                return
+            if not self.enabled:
+                self.rs.log(f"{self.side}: 请先使能")
+                return
+            if self.mode in _BUSY:
+                self.rs.log(f"{self.side}: busy ({self.mode.value})")
+                return
+            q0 = self._traj.q[0]
+            dq = float(np.max(np.abs(q0 - self._read_pos())))
+            dur = float(np.clip(dq / 0.3, 12.0, 60.0))   # ≤0.3 rad/s, floored
+            self._begin_move(q0, ArmMode.GO_START, "traj home", duration=dur)
+            self.rs.log(f"{self.side}: 匀速回轨迹起点 {dur:.0f}s (|Δq|max={np.degrees(dq):.0f}°)")
+
+    def _begin_imp_track(self, p: dict) -> None:
+        """Enter IMP_TRACK: anchor the impedance spring on the trajectory
+        start and let _step_imp_track walk the anchor along it."""
+        if self._imp is None:
+            self.rs.log(f"{self.side}: 阻抗模型不可用")
+            return
+        if not self.enabled:
+            self.rs.log(f"{self.side}: 请先使能")
+            return
+        if self.mode in _BUSY:
+            self.rs.log(f"{self.side}: busy ({self.mode.value})")
+            return
+        if self._traj is None:
+            self.rs.log(f"{self.side}: 先加载/录制轨迹")
+            return
+        q_now = self._read_pos()
+        d0 = float(np.max(np.abs(self._traj.q[0] - q_now)))
+        if d0 > 0.15:
+            self.rs.log(f"{self.side}: 距轨迹起点 {np.degrees(d0):.0f}° (>8.6°)，"
+                        f"先按[回起点]再回放")
+            return
+        sig = float(np.linalg.svd(
+            self._imp.m.jacobian6(q_now), compute_uv=False)[-1])
+        if sig < self._sig_warn:
+            self.rs.log(f"{self.side}: 拒绝回放——σ_min={sig:.3f}<{self._sig_warn} 奇异位")
+            return
+        self._trate = float(np.clip(p.get("rate", self._trate), 0.2, 1.0))
+        params = {k: p[k] for k in ("preset", "kx", "zeta") if k in p}
+        self._imp.set_params(**params)
+        if not self.gravity_on or self.grav_scale < 1.0:
+            self.gravity_on = True
+            self.grav_scale = max(self.grav_scale, 1.0)
+            self.rs.log(f"{self.side}: 回放自动开启重力补偿 scale={self.grav_scale:.2f}")
+        self._imp.start(self._traj.q[0])
+        if self._imp_plant is not None:
+            self._imp_plant.reset(q_now)
+        self._tplay = 0.0
+        self._tpaused = False
+        self._tresume_ct = 0
+        self.mode = ArmMode.IMP_TRACK
+        self.rs.set_mode(self.side, "IMP_TRACK", True)
+        dur = self._traj.play_duration(self._trate)
+        self.rs.log(f"{self.side}: 轨迹回放开始 [{self._imp.preset}] "
+                    f"Kx={self._imp.kx:.0f} ζ={self._imp.zeta:.2f} "
+                    f"{self._trate:.1f}x 预计{dur:.0f}s")
+
+    def _step_imp_track(self) -> None:
+        """One IMP_TRACK tick: advance the replay clock (unless paused by an
+        external push), move the impedance anchor to q_ref(t), then run the
+        stock impedance tick (all guards/trip-wires live)."""
+        from .traj_rec import ease_rate
+        if self._imp is None or self._traj is None:
+            self._exit_impedance("轨迹数据丢失 → 抱住")
+            return
+        dur = self._traj.play_duration(self._trate)
+        # advance the clock at the SUBSTEP rate: in sim _step_impedance
+        # integrates the plant at 250 Hz inside each 20 Hz outer tick, and
+        # the anchor must walk at the same cadence or the sim arm lags a
+        # full outer-tick behind every step (R2 hw-tracking failure).
+        n_sub = max(1, int(round(self._loop_dt / 0.004))) if self.sim else 1
+        dt_clk = self._loop_dt / n_sub
+        # deviation measured on the RAW (unweighted) anchor error so the
+        # singular-direction fade cannot hide a real displacement
+        raw_dx = np.linalg.norm(self._imp.x_des - np.asarray(
+            self._imp.m.fk(self._last_actual_q)[0], float))
+        if raw_dx > 0.05:
+            if not self._tpaused:
+                self._tpaused = True
+                self.rs.log(f"{self.side}: 外力偏离 {raw_dx*1000:.0f}mm → 轨迹暂停")
+            self._tresume_ct = 0
+        elif self._tpaused:
+            # resume just below the pause threshold (a 2–5 cm dead zone would
+            # trap the clock paused forever — sim probe finding); hold the
+            # requirement for 0.3s so a bouncing boundary doesn't chatter
+            self._tresume_ct += 1
+            if raw_dx < 0.045 and self._tresume_ct >= 15:
+                self._tpaused = False
+                self.rs.log(f"{self.side}: 已回位 → 轨迹继续")
+        else:
+            self._tplay += ease_rate(self._tplay, dur, self._trate) * dt_clk
+        if self._tplay >= self._traj.times[-1]:
+            # hold the anchor at the END pose until the arm catches up (the
+            # spring lags a moving anchor by design), then exit to PD
+            q_ref = self._traj.q[-1]
+            x, quat = self._imp.m.fk(q_ref)
+            self._imp.x_des = np.asarray(x, float).copy()
+            self._imp.R_des = self._imp._pin.Quaternion(
+                np.asarray(quat, float)).matrix()
+            self._imp.q_post = q_ref
+            lag = float(np.max(np.abs(q_ref - self._last_actual_q)))
+            if lag < 0.10 or self._tplay > self._traj.times[-1] + 5.0:
+                self.rs.update_arm(self.side, track_progress=1.0)
+                self._exit_impedance("轨迹回放完成 → 抱住终点")
+            return
+        q_ref = self._traj.sample_at(self._tplay)
+        # move the spring anchor along the trajectory
+        x, quat = self._imp.m.fk(q_ref)
+        self._imp.x_des = np.asarray(x, float).copy()
+        self._imp.R_des = self._imp._pin.Quaternion(np.asarray(quat, float)).matrix()
+        self._imp.q_post = q_ref
+        self.rs.update_arm(self.side, track_progress=self._tplay / self._traj.times[-1])
+        self._step_impedance()
+
     def _exit_impedance(self, why: str) -> None:
         """Leave impedance the safe way: capture pose, revert to motor-side PD hold.
 
@@ -484,9 +673,9 @@ class ArmController:
         self._dump_event(why)     # 5 s pre-exit control data for post-mortem
 
     def _process(self, mode: ArmMode, trajectory) -> None:
-        # any transition away from IMPEDANCE is an implicit impedance-exit
-        # (motion requests auto-fall-back to motor-side PD first)
-        if mode is not ArmMode.IMPEDANCE:
+        # any transition away from IMPEDANCE/IMP_TRACK is an implicit
+        # impedance-exit (motion requests auto-fall-back to motor-side PD)
+        if mode not in (ArmMode.IMPEDANCE, ArmMode.IMP_TRACK):
             self._imp_diag = None
         if mode == ArmMode.DISABLED:
             self._disable()
@@ -527,10 +716,12 @@ class ArmController:
             self.rs.set_mode(self.side, "TRACKING", True)
             self.rs.log(f"{self.side}: tracking trajectory")
 
-    def _begin_move(self, target: np.ndarray, mode: ArmMode, msg: str) -> None:
+    def _begin_move(self, target: np.ndarray, mode: ArmMode, msg: str,
+                    duration: float | None = None) -> None:
         self._move_target = np.asarray(target, dtype=float).copy()
         self._move_start = self._read_pos()
         self._move_t0 = time.time()
+        self._move_dur = duration if duration else MOVE_DUR
         self.mode = mode
         self.rs.set_mode(self.side, mode.value, True)
         self.rs.log(f"{self.side}: {msg} (will move!)")
@@ -605,6 +796,13 @@ class ArmController:
             self.rs.set_mode(self.side, "DISABLED", False)
             return
         self._actuate()
+        # trajectory recording: sample at 50 Hz WALL time (the sim loop runs
+        # at 20 Hz — a tick-count gate would sample 4x too slowly there)
+        if self._trec is not None:
+            now = time.monotonic()
+            if now - self._trec_last >= 0.02:
+                self._trec_last = now
+                self._trec.sample(pos)
         self._record(pos, vel, tau, tmos)
 
     def _sense(self):
@@ -659,6 +857,8 @@ class ArmController:
             self._step_track()
         elif self.mode == ArmMode.IMPEDANCE:
             self._step_impedance()
+        elif self.mode == ArmMode.IMP_TRACK:
+            self._step_imp_track()
 
     def _step_impedance(self) -> None:
         """Cartesian impedance tick: tau = J^T(K.d - D.xdot) + null + G(q).
@@ -816,6 +1016,20 @@ class ArmController:
             "push": bool(getattr(self._imp, "push_boost", 0.0) > 0.0),
         }
 
+    def traj_state(self) -> dict:
+        """Trajectory record/playback status for the web panel snapshot."""
+        return {
+            "rec": self._trec is not None,
+            "rec_s": round(time.time() - self._trec_t0, 1) if self._trec else 0.0,
+            "loaded": self._traj_name,
+            "dur": round(float(self._traj.times[-1]), 1) if self._traj else 0.0,
+            "playing": self.mode == ArmMode.IMP_TRACK,
+            "paused": self._tpaused,
+            "progress": (round(self._tplay / self._traj.times[-1], 3)
+                         if self._traj else 0.0),
+            "rate": round(self._trate, 2),
+        }
+
     def _hold_pd_tau(self) -> np.ndarray:
         """The PD part of _mit_hold (no gravity) — reused by the brake window."""
         kp = np.asarray(ARM_KP, float)
@@ -830,16 +1044,16 @@ class ArmController:
                               - np.asarray(ARM_KD, float) * self._last_actual_dq + g)
 
     def _step_move(self) -> None:
-        """Smooth linear interpolation _move_start -> _move_target over MOVE_DUR."""
+        """Smooth linear interpolation _move_start -> _move_target over _move_dur."""
         t = time.time() - self._move_t0
-        if t >= MOVE_DUR:
+        if t >= self._move_dur:
             self._hold_q = self._move_target.copy()
             self.mode = ArmMode.ENABLED_HOLD
             self.rs.set_mode(self.side, "ENABLED_HOLD", True)
             self.rs.update_arm(self.side, track_progress=1.0)
             self.rs.log(f"{self.side}: reached target, holding")
             return
-        frac = t / MOVE_DUR
+        frac = t / self._move_dur
         target = self._move_start + frac * (self._move_target - self._move_start)
         self._last_planned_q = target
         self.rs.update_arm(self.side, track_progress=frac)

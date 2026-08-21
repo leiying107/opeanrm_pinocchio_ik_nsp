@@ -109,6 +109,32 @@ for(const s of SIDES){
       <span class="lbl">漏速</span><input type="range" id="ipl-${s}" min="0" max="2" step="0.05" value="0"><span class="mut" id="iplv-${s}">0.00</span>
       <button id="ippush-${s}" class="b-imp_push">推20N·1s</button></div>
     <pre class="errtxt" id="imptxt-${s}">（使能后开阻抗：末端弹簧-阻尼，可推动回弹；漏速>0 变柔顺拖动）</pre>
+    <div class="ctitle">轨迹录制回放 ★（拖动录制 → 缓速回放，回放中可推开、松手回位继续）</div>
+    <div class="traj">
+      <div class="grp">
+        <button id="tr-rec-${s}" class="b-tr_rec">● 录制</button>
+        <button id="tr-stop-${s}" class="b-tr_stop">■ 停止并存</button>
+        <span class="mut" id="tr-recst-${s}">未录制</span>
+      </div>
+      <div class="grp">
+        <select id="tr-file-${s}"><option value="">— 轨迹文件 —</option></select>
+        <button id="tr-load-${s}" class="b-tr_load">加载</button>
+        <span class="lbl">倍率</span><input type="range" id="tr-rate-${s}" min="0.2" max="1" step="0.1" value="0.5"><span class="mut" id="tr-ratev-${s}">0.5x</span>
+      </div>
+      <div class="grp">
+        <span class="lbl">阻抗(回放独立)</span>
+        <select id="tr-pp-${s}"><option value="ultra">极软</option><option value="soft" selected>软</option><option value="mid">中</option></select>
+        <span class="lbl">Kx</span><input type="range" id="tr-kx-${s}" min="100" max="800" step="50" value="300"><span class="mut" id="tr-kxv-${s}">300</span>
+        <span class="lbl">ζ</span><input type="range" id="tr-z-${s}" min="0.5" max="1.5" step="0.05" value="1.4"><span class="mut" id="tr-zv-${s}">1.40</span>
+      </div>
+      <div class="grp">
+        <button id="tr-home-${s}" class="b-tr_home">⟲ 回起点</button>
+        <button id="tr-play-${s}" class="b-tr_play">▶ 回放</button>
+        <button id="tr-halt-${s}" class="b-tr_halt">■ 停止回放</button>
+      </div>
+      <div class="progress"><i id="tr-prog-${s}"></i></div>
+      <pre class="errtxt" id="tr-txt-${s}">（零力矩下●录制拖动动作 → ■保存 → 加载 → ⟲回起点 → ▶回放）</pre>
+    </div>
     <div class="ctitle">关节位置 (rad, 最近${(HIST/20).toFixed(0)}s)</div>
     <canvas id="cj-${s}" height="150"></canvas>
     <div class="ctitle">IK 跟踪误差 (mm / °) — 运动后保持稳态</div>
@@ -234,6 +260,19 @@ function render(snap){
       document.getElementById("iplv-"+s).textContent=imp.leak.toFixed(2);
       if(it)it.textContent=imp.on?fmtImp(imp):"（使能后开阻抗：末端弹簧-阻尼，可推动回弹；漏速>0 变柔顺拖动）";
     } else if(it){it.textContent="（阻抗模型不可用）";const cb=document.getElementById("ip-"+s);if(cb)cb.disabled=true;}
+    // ---- trajectory card readouts ----
+    const tr=a.traj, tt=document.getElementById("tr-txt-"+s), tp=document.getElementById("tr-prog-"+s);
+    if(tr){
+      const rs=document.getElementById("tr-recst-"+s);
+      rs.textContent=tr.rec?`录制中 ${tr.rec_s.toFixed(0)}s`:"未录制";
+      if(tp)tp.style.width=(tr.playing?Math.round(tr.progress*100):0)+"%";
+      let st="空闲";
+      if(tr.playing)st=tr.paused?"⏸ 暂停（外力偏离，回位后继续）":"▶ 回放中";
+      else if(tr.progress>=0.999)st="✓ 完成（抱住终点）";
+      if(tt)tt.textContent=
+        (tr.loaded?`文件: ${tr.loaded} (${tr.dur}s · ${tr.rate}x 预计${(tr.dur/tr.rate).toFixed(0)}s)`:"未加载轨迹")+
+        ` | ${st}`+(tr.playing?` | 进度 ${(tr.progress*100).toFixed(0)}%`:"");
+    }
     jointHist[s].push(a.joints);if(jointHist[s].length>HIST)jointHist[s].shift();
     if(a.err){
       errHist[s].push([a.err.pmag,a.err.omag]); if(errHist[s].length>HIST) errHist[s].shift();
@@ -302,6 +341,54 @@ for(const s of SIDES){
   }
   document.getElementById("ippush-"+s).addEventListener("click",()=>post("/impedance",{side:s,push:[20,0,0],dur:1.0}));
 }
+
+// ---- trajectory card wiring (record / files / replay) ----
+function trParams(s){
+  return {preset:document.getElementById("tr-pp-"+s).value,
+          kx:parseFloat(document.getElementById("tr-kx-"+s).value),
+          zeta:parseFloat(document.getElementById("tr-z-"+s).value),
+          rate:parseFloat(document.getElementById("tr-rate-"+s).value)};
+}
+for(const s of SIDES){
+  document.getElementById("tr-rec-"+s).addEventListener("click",()=>post("/traj",{side:s,op:"record_start"}));
+  document.getElementById("tr-stop-"+s).addEventListener("click",()=>post("/traj",{side:s,op:"record_stop"}));
+  document.getElementById("tr-load-"+s).addEventListener("click",()=>{
+    const f=document.getElementById("tr-file-"+s).value;
+    if(f)post("/traj",{side:s,op:"load",name:f});
+  });
+  document.getElementById("tr-home-"+s).addEventListener("click",()=>post("/traj",{side:s,op:"home"}));
+  document.getElementById("tr-play-"+s).addEventListener("click",()=>post("/traj",{side:s,op:"replay",...trParams(s)}));
+  document.getElementById("tr-halt-"+s).addEventListener("click",()=>post("/traj",{side:s,op:"stop"}));
+  for(const[id,lab] of [["tr-rate","tr-ratev"],["tr-kx","tr-kxv"],["tr-z","tr-zv"]]){
+    const el=document.getElementById(id+"-"+s);
+    el.addEventListener("input",()=>{
+      document.getElementById(lab+"-"+s).textContent=
+        id==="tr-rate"?parseFloat(el.value).toFixed(1)+"x":parseFloat(el.value).toFixed(id==="tr-kx"?0:2);
+    });
+  }
+  // preset snap for the replay impedance (independent of the point-hold card)
+  document.getElementById("tr-pp-"+s).addEventListener("change",()=>{
+    const pk={ultra:100,soft:300,mid:800}[document.getElementById("tr-pp-"+s).value];
+    document.getElementById("tr-kx-"+s).value=pk;
+    document.getElementById("tr-kxv-"+s).textContent=pk;
+  });
+}
+async function trRefreshFiles(){
+  try{
+    const r=await fetch("/traj",{method:"POST",headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({op:"list"})});
+    const j=await r.json();
+    for(const s of SIDES){
+      const sel=document.getElementById("tr-file-"+s);
+      const cur=sel.value;
+      sel.innerHTML='<option value="">— 轨迹文件 —</option>'+
+        (j.files||[]).map(f=>`<option value="${f.name}">${f.name} (${f.duration}s${f.side?("·"+f.side):""})</option>`).join("");
+      if(cur&&[...sel.options].some(o=>o.value===cur))sel.value=cur;
+    }
+  }catch(e){}
+}
+trRefreshFiles();
+setInterval(trRefreshFiles,10000);
 
 // ---- SSE connect with reconnect + staleness pill ----
 let lastTick=0,backoff=1000;

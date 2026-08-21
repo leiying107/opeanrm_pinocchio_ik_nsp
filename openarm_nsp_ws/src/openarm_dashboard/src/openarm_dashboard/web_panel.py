@@ -261,6 +261,7 @@ def _snapshot() -> dict:
             "grav_on": c.gravity_on if c else False,
             "grav_scale": round(float(c.grav_scale), 2) if c else 0.0,
             "imp": c.imp_state() if c else None,
+            "traj": c.traj_state() if c else None,
         }
     return out
 
@@ -404,6 +405,25 @@ async def _impedance(req: Request):
         return _ok()
     params = {k: b[k] for k in ("preset", "kx", "zeta", "leak") if b.get(k) is not None}
     c.request_impedance(bool(b.get("on", False)), params)
+    return _ok()
+
+
+@app.post("/traj")
+async def _traj(req: Request):
+    """Trajectory record/playback: {side, op, name?, rate?, preset?, kx?, zeta?}
+    op ∈ record_start | record_stop | load | replay | stop | home | list."""
+    b = await req.json()
+    _cmd_log("/traj", b)
+    op = b.get("op")
+    if op == "list":
+        from .traj_rec import TrajData
+        return _ok(files=TrajData.list_files())
+    side = b.get("side")
+    if side not in SIDES:
+        return _ok(False, err="bad side")
+    if op not in ("record_start", "record_stop", "load", "replay", "stop", "home"):
+        return _ok(False, err=f"bad op {op}")
+    controllers[side].request_traj(op, b)
     return _ok()
 
 
