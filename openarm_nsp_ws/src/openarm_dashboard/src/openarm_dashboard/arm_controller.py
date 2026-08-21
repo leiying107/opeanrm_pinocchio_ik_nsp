@@ -94,7 +94,7 @@ CTRL_HEADER = ("t,mode,enabled,grav_on,grav_scale,"
                + "," + ",".join(f"taus{i}" for i in range(ARM_DOF))
                + "," + ",".join(f"tauc{i}" for i in range(ARM_DOF))
                + "," + ",".join(f"tmos{i}" for i in range(ARM_DOF))
-               + ",dx0,dx1,dx2,fest0,fest1,fest2,sigma,ramp")
+               + ",dx0,dx1,dx2,fest0,fest1,fest2,sigma,ramp,buckle,push")
 RING_N = 7500      # rows @ 250 Hz = 30 s
 
 
@@ -173,6 +173,10 @@ class ArmController:
         # velocity / joint-limit trip-wires (exit-to-PD, NOT software limiting)
         self._imp_vtrip = 4.0       # rad/s -> count toward exit
         self._imp_vslow = 0         # windowed over-speed counter (decay, no reset)
+        # inward axial-push detector state (buckle assist)
+        self._last_actual_tau = np.zeros(ARM_DOF)
+        self._imp_tau_res = np.zeros(ARM_DOF)   # LPF'd tau_sensed - tau_cmd
+        self._imp_push_ct = 0
         self._imp_lower = np.full(ARM_DOF, -3.05)
         self._imp_upper = np.full(ARM_DOF, 3.05)
         try:
@@ -237,9 +241,11 @@ class ArmController:
         if st and st.get("dx") is not None:
             cols += [f"{v:.3g}" for v in st["dx"]]
             cols += [f"{v:.3g}" for v in st["fest"]]
-            cols += [f"{st['sigma']:.4g}", f"{st['ramp']:.2f}"]
+            cols += [f"{st['sigma']:.4g}", f"{st['ramp']:.2f}",
+                     f"{st.get('buckle', 0):.2f}",
+                     str(int(self._imp.push_boost > 0.0)) if self._imp else "0"]
         else:
-            cols += ["nan"] * 8
+            cols += ["nan"] * 10
         return ",".join(cols) + "\n"
 
     def _record(self, q, dq, tau_s, tmos) -> None:
@@ -363,6 +369,13 @@ class ArmController:
                 msg = f"{self.side}: loop error {type(e).__name__}: {e}"
                 print(msg, flush=True)
                 self.rs.log(msg)
+                # a failed tick in IMPEDANCE means NO torque frame went out —
+                # never keep the mode alive on a broken loop; drop to PD hold
+                if self.mode == ArmMode.IMPEDANCE:
+                    try:
+                        self._exit_impedance(f"loop error {type(e).__name__} → 抱住")
+                    except Exception:  # noqa: BLE001 - last resort
+                        self._disable()
             dt = time.time() - t0
             if dt < rate:
                 time.sleep(rate - dt)
@@ -580,6 +593,7 @@ class ArmController:
         pos, vel, tau, tmos, trotor = self._sense()
         self._last_actual_q = pos
         self._last_actual_dq = vel
+        self._last_actual_tau = tau
         self.rs.update_arm(self.side, position=pos, velocity=vel, torque=tau,
                            tmos=tmos, trotor=trotor)
         self.buf.append(self.side, pos, tau, tmos)
@@ -713,9 +727,17 @@ class ArmController:
             return
         self._imp_diag = diag
         if diag["sigma"] < self._sig_crit:
-            self._exit_impedance(
-                f"σ_min={diag['sigma']:.3f}<{self._sig_crit} 奇异硬保护 → 抱住")
-            return
+            # PERSISTENCE gate: brief sigma dips happen when a push carries the
+            # arm THROUGH an interior low-sigma pocket (sim: 0.7s crossing with
+            # clean recovery after) — exiting on the first sub-critical tick
+            # aborted recoverable transits. Require a sustained violation.
+            self._imp_siglow = getattr(self, "_imp_siglow", 0) + 1
+            if self._imp_siglow >= 125:    # 0.5 s sustained @250Hz
+                self._exit_impedance(
+                    f"σ_min={diag['sigma']:.3f}<{self._sig_crit} 奇异硬保护(持续0.5s) → 抱住")
+                return
+        else:
+            self._imp_siglow = 0
         # --- velocity / joint-limit trip-wires (real hw only) -----------------
         # NOT a software speed limiter: commanded damping is ZOH-capped at
         # 0.2*I/dt (0.15 Nm at the wrist) and CANNOT stop a fast arm, and
@@ -745,6 +767,25 @@ class ArmController:
                 self._exit_impedance(
                     f"逼近关节限位({np.degrees(margin):.1f}°) → 抱住")
                 return
+            # --- inward axial-push detector (buckle assist) --------------------
+            # tau_sensed - tau_cmd ≈ J^T F_ext: an inward push along the
+            # (nearly lost) radial direction projects onto v_dir as sigma*|F|
+            # (verified numerically: 20N @ sigma=0.042 -> 0.849 Nm = theory).
+            # Residual is LPF'd (10 Hz); decay counter over a 0.15 Nm (3-sigma)
+            # threshold; noise floor measured at 1sigma≈0.05 Nm in the field.
+            if diag.get("vdir") is not None and diag["sigma"] < 0.12:
+                raw = self._last_actual_tau - self._last_cmd_tau
+                a = self._loop_dt / (self._loop_dt + 1.0 / (2.0 * np.pi * 10.0))
+                self._imp_tau_res += a * (raw - self._imp_tau_res)
+                p = float(self._imp_tau_res @ diag["vdir"])
+                if p > 0.15:
+                    self._imp_push_ct += 1
+                else:
+                    self._imp_push_ct = max(0, self._imp_push_ct - 1)
+                if self._imp_push_ct >= 25:   # 0.1 s sustained
+                    self._imp_push_ct = 0
+                    self._imp.push_boost = 0.5
+                    self.rs.log(f"{self.side}: 检测到轴向内推 → 屈肘协助0.5s")
         tau = np.clip(tau_imp + self._grav_tau(), -self._imp_tmax, self._imp_tmax)
         self._last_cmd_tau = tau
         # kp=0 + kd=IMP_KD(=0 on real hw): pure torque, the validated path
@@ -770,6 +811,9 @@ class ArmController:
             "qdot": round(float(d["qdot"]), 2) if d else None,
             "ramp": d.get("ramp") if d else None,
             "sigma": d.get("sigma") if d else None,
+            "buckle": d.get("buckle") if d else None,   # flexion-pull blend 0-1
+            "frozen": d.get("frozen") if d else None,   # singular dir under-actuated
+            "push": bool(getattr(self._imp, "push_boost", 0.0) > 0.0),
         }
 
     def _hold_pd_tau(self) -> np.ndarray:

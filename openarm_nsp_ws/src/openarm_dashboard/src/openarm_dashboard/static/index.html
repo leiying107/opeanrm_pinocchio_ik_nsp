@@ -105,7 +105,7 @@ for(const s of SIDES){
     <div class="imp"><label><input type="checkbox" id="ip-${s}"> 阻抗</label>
       <select id="ipp-${s}"><option value="ultra" selected>极软</option><option value="soft">软</option><option value="mid">中</option><option value="stiff">硬</option></select>
       <span class="lbl">Kx</span><input type="range" id="ipk-${s}" min="100" max="2000" step="50" value="100"><span class="mut" id="ipkv-${s}">100</span>
-      <span class="lbl">ζ</span><input type="range" id="ipz-${s}" min="0.5" max="1.5" step="0.05" value="1"><span class="mut" id="ipzv-${s}">1.00</span>
+      <span class="lbl">ζ</span><input type="range" id="ipz-${s}" min="0.5" max="1.5" step="0.05" value="1.4"><span class="mut" id="ipzv-${s}">1.40</span>
       <span class="lbl">漏速</span><input type="range" id="ipl-${s}" min="0" max="2" step="0.05" value="0"><span class="mut" id="iplv-${s}">0.00</span>
       <button id="ippush-${s}" class="b-imp_push">推20N·1s</button></div>
     <pre class="errtxt" id="imptxt-${s}">（使能后开阻抗：末端弹簧-阻尼，可推动回弹；漏速>0 变柔顺拖动）</pre>
@@ -204,7 +204,7 @@ function fmtImp(imp){
   const pm=Math.hypot(dx,dy,dz),fm=Math.hypot(f[0],f[1],f[2]);
   const pa=[["前","后",dx],["左","右",dy],["上","下",dz]].sort((a,b)=>Math.abs(b[2])-Math.abs(a[2]))[0];
   return head+`\nΔx ${pm.toFixed(1)}mm (前${sgn(dx)} 左${sgn(dy)} 上${sgn(dz)}) → 偏${pa[2]>=0?pa[0]:pa[1]} ${Math.abs(pa[2]).toFixed(1)}mm | F≈${fm.toFixed(1)}N\n`+
-         `Δθ ${Math.hypot(r,p,y).toFixed(2)}° (R${sgn(r,2)} P${sgn(p,2)} Y${sgn(y,2)}) | q̇max ${imp.qdot}rad/s | σ ${imp.sigma!=null?imp.sigma.toFixed(3):"—"}${imp.sigma!=null&&imp.sigma<0.05?" ⚠奇异":""}`;
+         `Δθ ${Math.hypot(r,p,y).toFixed(2)}° (R${sgn(r,2)} P${sgn(p,2)} Y${sgn(y,2)}) | q̇max ${imp.qdot}rad/s | σ ${imp.sigma!=null?imp.sigma.toFixed(3):"—"}${imp.frozen?" ⊘径向欠驱动":""}${imp.buckle>0.05?` 屈肘${Math.round(imp.buckle*100)}%`:""}${imp.push?" ✊内推":""}`;
 }
 
 // ---- render an SSE snapshot ----
@@ -284,7 +284,16 @@ function sendImp(s){post("/impedance",{side:s,on:document.getElementById("ip-"+s
   leak:parseFloat(document.getElementById("ipl-"+s).value)});}
 for(const s of SIDES){
   document.getElementById("ip-"+s).addEventListener("change",()=>sendImp(s));
-  document.getElementById("ipp-"+s).addEventListener("change",()=>{if(document.getElementById("ip-"+s).checked)sendImp(s);});
+  // preset switch snaps the Kx slider to the preset's value — otherwise the
+  // stale slider value is sent explicitly and OVERRIDES the preset (hw
+  // 2026-08-19: "soft" test actually ran at ultra's Kx=100 the whole time)
+  document.getElementById("ipp-"+s).addEventListener("change",()=>{
+    const pk={ultra:100,soft:300,mid:800,stiff:1500}[document.getElementById("ipp-"+s).value];
+    const kEl=document.getElementById("ipk-"+s);
+    kEl.value=pk;
+    document.getElementById("ipkv-"+s).textContent=pk;
+    if(document.getElementById("ip-"+s).checked)sendImp(s);
+  });
   const impDeb={};
   for(const[id,lab,fix] of [["ipk","ipkv",0],["ipz","ipzv",2],["ipl","iplv",2]]){
     const el=document.getElementById(id+"-"+s);

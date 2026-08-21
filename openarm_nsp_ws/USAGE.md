@@ -2,7 +2,7 @@
 
 > 路径：`/ros2_ws/openarm_nsp_ws/`
 > 目标机器人：OpenArm v1.0（7-DoF × 2 双臂，达妙电机，CAN-FD）
-> 最后更新：2026-08-17（阻抗：奇异点三层防护 + 落盘调试日志，见 IMPEDANCE_SAFETY.md）
+> 最后更新：2026-08-19（阻抗 v5：方向感知奇异防护 + 主动屈肘 + 暴力压测，见 IMPEDANCE_THEORY.md §4/§8.1）
 
 ---
 
@@ -602,8 +602,9 @@ ros2 run openarm_dashboard web_panel --can-slot 1 --port 8050   # 显式
 | `web_panel.py` | ★ 新一代面板：FastAPI + SSE + canvas 后端（推荐） |
 | `static/index.html` | ★ web_panel 前端（原生 JS + canvas） |
 | `gravity.py` | ★ 重力补偿 G(q)（pinocchio on v1_simple.urdf） |
-| `impedance.py` | ★ 笛卡尔 6D 阻抗 + sim 动力学被控对象（aba） |
-| `scripts/test_impedance_sim.py` | ★ 阻抗+奇异防护 6 项 sim 测试套件（headless） |
+| `impedance.py` | ★ 笛卡尔 6D 阻抗 + sim 动力学被控对象（aba，含 URDF 限位投影挡块） |
+| `scripts/test_impedance_sim.py` | ★ 阻抗+奇异防护 10 项 sim 测试套件（headless） |
+| `scripts/test_impedance_stress.py` | ★ 暴力压测（5 层×2084 场景，分片并行） |
 | `IMPEDANCE_SAFETY.md` | ★ 阻抗安全启动手册（参数含义/安全位姿/奇异防护/调试日志） |
 | `IMPEDANCE_THEORY.md` | ★ 阻抗原理与实现（控制律/模式机/线程模型/实时性保障） |
 | `hardware_dashboard.py` | 旧版 Dash 面板（fallback） |
@@ -654,6 +655,20 @@ MITParam(kp=0, kd=IMP_KD, 0, 0, τ)   # 纯力矩 + 电机侧阻尼兜底（零�
 ‖Δx‖≤10cm、‖Δθ‖≤0.5rad 钳位；τ 按 TMAX 钳位；计算超时(>8ms)/异常 → 自动抱住；
 q̇>3rad/s 只衰减弹簧（阻尼不衰减）；过热保护沿用。**实机阶梯**：手扶臂 → 软档 →
 ζ=1.0 → 逐级加硬；一次一臂，另一臂抱住；先演练急停（失能）。
+
+### 奇异点（v5 方向感知）★
+
+奇异是**方向性**的：伸直手臂只有径向（肩→手连线）失控，其余 5 方向可动。
+v5 只淡化失控方向（W=U·diag(σ²/(σ²+0.05²))·Uᵀ 作用于弹簧与阻尼），并以
+**速率型屈肘控制**沿折叠方向 v_dir（j1+j4 耦合、末端几乎不动）守住 σ：
+
+- 向外拉到接近伸直 → 渐进"软挡块"（σ 托在 ~0.04–0.05），到不了真奇异
+- 沿臂轴向内推 → 主动屈肘让位（实机另有推力检测 τ_sensed−τ_cmd→v_dir 投影）
+- 伸直位侧向推 → 正常柔顺（压测：σ=0.057 时 20N 让位 68mm ≈ 理论 67mm）
+- 入口门禁 σ≥0.05 不变；硬退出 σ<0.02 兜底保留
+
+读数：σ 旁显示 `⊘径向欠驱动` / `屈肘xx%` / `✊内推`。压测与调参红线详见
+`IMPEDANCE_THEORY.md` §4/§8.1 与 `IMPEDANCE_SAFETY.md` §6。
 
 ### 验证记录（sim, pinocchio aba 被控对象 + 虚拟推力）
 
