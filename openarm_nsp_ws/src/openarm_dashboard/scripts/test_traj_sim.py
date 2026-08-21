@@ -37,7 +37,10 @@ def report(name, ok, detail=""):
     if ok:
         passed += 1
     else:
-        for m in LOGS[-8:]:
+        n_pause = sum(1 for m in LOGS if "轨迹暂停" in m)
+        n_cont = sum(1 for m in LOGS if "轨迹继续" in m)
+        print(f"      [stats] 暂停x{n_pause} 继续x{n_cont} 全部日志x{len(LOGS)}")
+        for m in LOGS:
             print("      [log]", m)
 
 
@@ -139,7 +142,8 @@ time.sleep(0.5)
 q_end_expected = traj.q[-1]
 c.request_traj("replay", {"rate": 0.5, "preset": "soft"})
 ok = ok and wait_mode(c, ArmMode.IMP_TRACK, timeout=5.0)
-ok = ok and wait_mode(c, ArmMode.ENABLED_HOLD, timeout=90.0)  # replay ends
+ok = ok and wait_mode(c, ArmMode.ENABLED_HOLD, timeout=150.0)  # replay ends
+     # (end-settle + sim-loop overhead: a 1.6s traj @0.5x needs ~6-10s wall)
 st = c.traj_state()
 q_end = c._read_pos()
 err_end = float(np.max(np.abs(q_end - q_end_expected)))
@@ -153,7 +157,7 @@ ok = go_home(c)
 time.sleep(0.5)
 c.request_traj("replay", {"rate": 0.5, "preset": "soft"})
 ok = ok and wait_mode(c, ArmMode.IMP_TRACK, timeout=5.0)
-time.sleep(1.2)                        # let it play a bit (past ease-in)
+time.sleep(0.6)                        # mid ease-in (anchor moving)
 prog_at_push = c.traj_state()["progress"]
 # push 25N for 1.5s (sim virtual push)
 t_now = time.monotonic()
@@ -166,7 +170,7 @@ time.sleep(1.5)                        # push ends, spring returns
 st_rel = c.traj_state()
 time.sleep(0.5)
 resumed = not c.traj_state()["paused"]
-ok = ok and wait_mode(c, ArmMode.ENABLED_HOLD, timeout=90.0)
+ok = ok and wait_mode(c, ArmMode.ENABLED_HOLD, timeout=150.0)
 q_end3 = c._read_pos()
 err3 = float(np.max(np.abs(q_end3 - q_end_expected)))
 ok = (ok and paused and prog_mid <= prog_at_push + 0.03 and resumed

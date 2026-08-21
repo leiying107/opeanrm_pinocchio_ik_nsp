@@ -169,18 +169,23 @@ def _trim_still(q: np.ndarray, dt: float) -> np.ndarray:
 
 def ease_rate(t_play: float, dur: float, rate: float) -> float:
     """Instantaneous replay-rate FACTOR (multiplier on `rate`), quintic-eased
-    over PLAY_EASE_S of TRAJECTORY time at both ends (speed bump
-    s'(τ)=30τ²(1−τ)²/1.875). A 15% floor keeps the integrated clock moving
-    at the very start/end — the pure bump is exactly 0 at τ=0, which
-    deadlocks a clock whose rate is its own integral (found in sim R2).
-    The ease window is in TRAJECTORY seconds, so slow rates (0.2x) stretch
-    the wall-time ease proportionally — by design: a slow replay should
-    also start/stop slowly."""
-    e = min(PLAY_EASE_S, dur / 4.0)
-    if t_play < e:
-        s = t_play / e
-    elif t_play > dur - e:
-        s = max(0.0, (dur - t_play) / e)
+    at both ends (speed bump s'(τ)=30τ²(1−τ)²/1.875). Two hard-won guards:
+    (1) 15% floor — the pure bump is exactly 0 at τ=0, deadlocking a clock
+    whose rate is its own integral; (2) the ease window is min(PLAY_EASE_S,
+    15% of the trajectory) — with the old dur/4 cap a 1.6s recording spent
+    HALF its replay inside the ease crawling at the floor (0.075x), turning
+    a 4s replay into >90s (sim R2 nondeterministic timeout). NOTE `dur` is
+    the WALL-clock playback duration; ease comparisons happen in TRAJECTORY
+    seconds, so scale the window by `rate`."""
+    e = min(PLAY_EASE_S * rate, 0.15 * dur * rate)
+    if e <= 0:
+        return rate
+    t_traj = t_play  # trajectory seconds
+    total = dur * rate
+    if t_traj < e:
+        s = t_traj / e
+    elif t_traj > total - e:
+        s = max(0.0, (total - t_traj) / e)
     else:
         return rate
     f = 30 * s ** 2 * (1 - s) ** 2 / 1.875
