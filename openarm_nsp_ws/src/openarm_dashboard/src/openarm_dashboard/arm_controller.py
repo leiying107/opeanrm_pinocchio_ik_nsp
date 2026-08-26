@@ -50,11 +50,6 @@ ARM_KP = [70.0, 70.0, 70.0, 60.0, 10.0, 10.0, 10.0]
 ARM_KD = [2.75, 2.5, 2.0, 2.0, 0.7, 0.6, 0.5]
 ZERO_POSITION = np.zeros(ARM_DOF)
 MOVE_DUR = 2.0   # seconds for home / go_start interpolation
-# IMP_TRACK anchor-orientation slew cap (rad/s): see _step_imp_track — a
-# shoulder-sweep recording rotates the FK orientation reference at the
-# shoulder rate, which fed the wrist orientation loop into an 8.5 Hz
-# blow-up on hw. Cap how fast R_des may rotate during replay.
-TRACK_ORIENT_MAX = 0.5
 
 TMOS_WARN, TMOS_ERROR = 70, 85
 
@@ -192,6 +187,7 @@ class ArmController:
         self._trec_last = 0.0          # last 50Hz sample time
         self._traj = None              # loaded TrajData
         self._traj_name = ""
+        self._kr_saved = None          # pre-replay Kr (restored on exit)
         self._tplay = 0.0              # replay clock (trajectory seconds)
         self._tpaused = False
         self._tresume_ct = 0
@@ -580,6 +576,11 @@ class ArmController:
         self._trate = float(np.clip(p.get("rate", self._trate), 0.2, 1.0))
         params = {k: p[k] for k in ("preset", "kx", "zeta") if k in p}
         self._imp.set_params(**params)
+        # JOINT-SPACE replay: silence the EE ORIENTATION spring for the whole
+        # replay (wrist/config tracking is carried by the joint springs with
+        # q_post = q_ref). Kr is restored on exit (_exit_impedance).
+        self._kr_saved = self._imp.kr
+        self._imp.kr = 0.0
         if not self.gravity_on or self.grav_scale < 1.0:
             self.gravity_on = True
             self.grav_scale = max(self.grav_scale, 1.0)
@@ -600,7 +601,17 @@ class ArmController:
     def _step_imp_track(self) -> None:
         """One IMP_TRACK tick: advance the replay clock (unless paused by an
         external push), move the impedance anchor to q_ref(t), then run the
-        stock impedance tick (all guards/trip-wires live)."""
+        stock impedance tick (all guards/trip-wires live).
+
+        JOINT-SPACE replay (user decision 2026-08-26): the recorded joint
+        angles ARE the reference. The EE POSITION spring (x_des from FK of
+        q_ref) provides push-compliance at the hand; the wrist/config
+        tracking is carried by the JOINT-space springs (posture q_post +
+        config-return, both = q_ref) instead of the EE ORIENTATION spring —
+        during a shoulder sweep the FK orientation rotates at the shoulder
+        rate even with wrist joints held, which fed the ZOH-capped wrist
+        orientation loop into an 8.5 Hz blow-up (hw 2026-08-26). Kr is set
+        to 0 for the whole replay (restored on exit)."""
         from .traj_rec import ease_rate
         if self._imp is None or self._traj is None:
             self._exit_impedance("轨迹数据丢失 → 抱住")
@@ -610,7 +621,6 @@ class ArmController:
         # FULL tick each call. (A previous "substep clock" made the clock 12x
         # too slow in sim — R2 timeouts with progress ~0.99.) The anchor
         # simply jumps by rate*loop_dt per tick, which the spring filters.
-        n_sub = 1
         dt_clk = self._loop_dt
         # deviation measured on the RAW (unweighted) anchor error so the
         # singular-direction fade cannot hide a real displacement
@@ -633,50 +643,21 @@ class ArmController:
             self._tplay += ease_rate(self._tplay, dur, self._trate) * dt_clk
         if self._tplay >= self._traj.times[-1]:
             # hold the anchor at the END pose until the arm catches up (the
-            # spring lags a moving anchor by design), then exit to PD.
-            # R_des also rate-limits here: the capped orientation lags the
-            # end pose by up to (sweep rate / cap) * duration; jumping it
-            # the last bit would snap the wrist the cap just protected.
+            # spring lags a moving anchor by design), then exit to PD
             q_ref = self._traj.q[-1]
             x, quat = self._imp.m.fk(q_ref)
             self._imp.x_des = np.asarray(x, float).copy()
-            R_end = self._imp._pin.Quaternion(
-                np.asarray(quat, float)).matrix()
-            e_rot = self._imp._pin.log3(R_end @ self._imp.R_des.T)
-            e_norm = float(np.linalg.norm(e_rot))
-            max_step = TRACK_ORIENT_MAX * dt_clk
-            if e_norm > max_step > 1e-9:
-                R_end = self._imp._pin.exp3(
-                    e_rot * (max_step / e_norm)) @ self._imp.R_des
-            self._imp.R_des = R_end
             self._imp.q_post = q_ref
             lag = float(np.max(np.abs(q_ref - self._last_actual_q)))
-            e_left = e_norm - max_step
-            if ((lag < 0.10 and e_left < 0.05)
-                    or self._tplay > self._traj.times[-1] + 8.0):
+            if lag < 0.10 or self._tplay > self._traj.times[-1] + 5.0:
                 self.rs.update_arm(self.side, track_progress=1.0)
                 self._exit_impedance("轨迹回放完成 → 抱住终点")
             return
         q_ref = self._traj.sample_at(self._tplay)
-        # move the spring anchor along the trajectory
+        # move the POSITION anchor along the trajectory (joint-space replay:
+        # wrist orientation is carried by q_post, NOT by R_des — see docstring)
         x, quat = self._imp.m.fk(q_ref)
         self._imp.x_des = np.asarray(x, float).copy()
-        R_new = self._imp._pin.Quaternion(np.asarray(quat, float)).matrix()
-        # ORIENTATION RATE CAP: a shoulder-sweep recording holds the wrist
-        # joints ~constant while the anchor orientation rotates at up to the
-        # shoulder rate (~1 rad/s) — the wrist orientation loop (Kr=8, ZOH-
-        # capped damping) is continuously fed by a rotating reference and
-        # blew up at 8.5 Hz / ±0.4 rad on hw (2026-08-26 09:38, j5 13.7 rad/s)
-        # while |dx| stayed at 6mm (position fine, orientation fought). Slew-
-        # limit R_des to TRACK_ORIENT_MAX rad/s: slow orientation tracking,
-        # position untouched, no control-law change; the end pose settles
-        # exactly once the anchor stops moving.
-        e_rot = self._imp._pin.log3(R_new @ self._imp.R_des.T)
-        e_norm = float(np.linalg.norm(e_rot))
-        max_step = TRACK_ORIENT_MAX * dt_clk
-        if e_norm > max_step > 1e-9:
-            R_new = self._imp._pin.exp3(e_rot * (max_step / e_norm)) @ self._imp.R_des
-        self._imp.R_des = R_new
         self._imp.q_post = q_ref
         self.rs.update_arm(self.side, track_progress=self._tplay / self._traj.times[-1])
         self._step_impedance()
@@ -689,6 +670,10 @@ class ArmController:
         + high velocity = a hard brake + overshoot "rebound". Ramp the hold
         target over ~0.5 s from the frozen pose to a soft landing pose instead
         of stepping kp on instantly — RECOVER_MOVE style damping-first stop."""
+        # restore the EE orientation spring if a joint-space replay zeroed it
+        if getattr(self, "_kr_saved", None) is not None and self._imp is not None:
+            self._imp.kr = self._kr_saved
+            self._kr_saved = None
         self._hold_q = self._read_pos()
         vmax = float(np.max(np.abs(self._last_actual_dq))) if self._last_actual_dq is not None else 0.0
         if vmax > 2.0 and not self.sim:
