@@ -50,6 +50,11 @@ ARM_KP = [70.0, 70.0, 70.0, 60.0, 10.0, 10.0, 10.0]
 ARM_KD = [2.75, 2.5, 2.0, 2.0, 0.7, 0.6, 0.5]
 ZERO_POSITION = np.zeros(ARM_DOF)
 MOVE_DUR = 2.0   # seconds for home / go_start interpolation
+# IMP_TRACK anchor-orientation slew cap (rad/s): see _step_imp_track — a
+# shoulder-sweep recording rotates the FK orientation reference at the
+# shoulder rate, which fed the wrist orientation loop into an 8.5 Hz
+# blow-up on hw. Cap how fast R_des may rotate during replay.
+TRACK_ORIENT_MAX = 0.5
 
 TMOS_WARN, TMOS_ERROR = 70, 85
 
@@ -601,12 +606,12 @@ class ArmController:
             self._exit_impedance("轨迹数据丢失 → 抱住")
             return
         dur = self._traj.play_duration(self._trate)
-        # advance the clock at the SUBSTEP rate: in sim _step_impedance
-        # integrates the plant at 250 Hz inside each 20 Hz outer tick, and
-        # the anchor must walk at the same cadence or the sim arm lags a
-        # full outer-tick behind every step (R2 hw-tracking failure).
-        n_sub = max(1, int(round(self._loop_dt / 0.004))) if self.sim else 1
-        dt_clk = self._loop_dt / n_sub
+        # this method runs ONCE per loop tick, so the clock advances by the
+        # FULL tick each call. (A previous "substep clock" made the clock 12x
+        # too slow in sim — R2 timeouts with progress ~0.99.) The anchor
+        # simply jumps by rate*loop_dt per tick, which the spring filters.
+        n_sub = 1
+        dt_clk = self._loop_dt
         # deviation measured on the RAW (unweighted) anchor error so the
         # singular-direction fade cannot hide a real displacement
         raw_dx = np.linalg.norm(self._imp.x_des - np.asarray(
@@ -628,15 +633,27 @@ class ArmController:
             self._tplay += ease_rate(self._tplay, dur, self._trate) * dt_clk
         if self._tplay >= self._traj.times[-1]:
             # hold the anchor at the END pose until the arm catches up (the
-            # spring lags a moving anchor by design), then exit to PD
+            # spring lags a moving anchor by design), then exit to PD.
+            # R_des also rate-limits here: the capped orientation lags the
+            # end pose by up to (sweep rate / cap) * duration; jumping it
+            # the last bit would snap the wrist the cap just protected.
             q_ref = self._traj.q[-1]
             x, quat = self._imp.m.fk(q_ref)
             self._imp.x_des = np.asarray(x, float).copy()
-            self._imp.R_des = self._imp._pin.Quaternion(
+            R_end = self._imp._pin.Quaternion(
                 np.asarray(quat, float)).matrix()
+            e_rot = self._imp._pin.log3(R_end @ self._imp.R_des.T)
+            e_norm = float(np.linalg.norm(e_rot))
+            max_step = TRACK_ORIENT_MAX * dt_clk
+            if e_norm > max_step > 1e-9:
+                R_end = self._imp._pin.exp3(
+                    e_rot * (max_step / e_norm)) @ self._imp.R_des
+            self._imp.R_des = R_end
             self._imp.q_post = q_ref
             lag = float(np.max(np.abs(q_ref - self._last_actual_q)))
-            if lag < 0.10 or self._tplay > self._traj.times[-1] + 5.0:
+            e_left = e_norm - max_step
+            if ((lag < 0.10 and e_left < 0.05)
+                    or self._tplay > self._traj.times[-1] + 8.0):
                 self.rs.update_arm(self.side, track_progress=1.0)
                 self._exit_impedance("轨迹回放完成 → 抱住终点")
             return
@@ -644,7 +661,22 @@ class ArmController:
         # move the spring anchor along the trajectory
         x, quat = self._imp.m.fk(q_ref)
         self._imp.x_des = np.asarray(x, float).copy()
-        self._imp.R_des = self._imp._pin.Quaternion(np.asarray(quat, float)).matrix()
+        R_new = self._imp._pin.Quaternion(np.asarray(quat, float)).matrix()
+        # ORIENTATION RATE CAP: a shoulder-sweep recording holds the wrist
+        # joints ~constant while the anchor orientation rotates at up to the
+        # shoulder rate (~1 rad/s) — the wrist orientation loop (Kr=8, ZOH-
+        # capped damping) is continuously fed by a rotating reference and
+        # blew up at 8.5 Hz / ±0.4 rad on hw (2026-08-26 09:38, j5 13.7 rad/s)
+        # while |dx| stayed at 6mm (position fine, orientation fought). Slew-
+        # limit R_des to TRACK_ORIENT_MAX rad/s: slow orientation tracking,
+        # position untouched, no control-law change; the end pose settles
+        # exactly once the anchor stops moving.
+        e_rot = self._imp._pin.log3(R_new @ self._imp.R_des.T)
+        e_norm = float(np.linalg.norm(e_rot))
+        max_step = TRACK_ORIENT_MAX * dt_clk
+        if e_norm > max_step > 1e-9:
+            R_new = self._imp._pin.exp3(e_rot * (max_step / e_norm)) @ self._imp.R_des
+        self._imp.R_des = R_new
         self._imp.q_post = q_ref
         self.rs.update_arm(self.side, track_progress=self._tplay / self._traj.times[-1])
         self._step_impedance()
@@ -1017,16 +1049,22 @@ class ArmController:
         }
 
     def traj_state(self) -> dict:
-        """Trajectory record/playback status for the web panel snapshot."""
+        """Trajectory record/playback status for the web panel snapshot.
+
+        ``self._traj`` is DUAL-PURPOSE: a ``TrajData`` (recorder playback,
+        has ``.times``) or a ``(times, q_path)`` tuple (TRACKING from the
+        dashboard planners). Snapshot fields only make sense for the former.
+        """
+        is_td = hasattr(self._traj, "times")
         return {
             "rec": self._trec is not None,
             "rec_s": round(time.time() - self._trec_t0, 1) if self._trec else 0.0,
             "loaded": self._traj_name,
-            "dur": round(float(self._traj.times[-1]), 1) if self._traj else 0.0,
+            "dur": round(float(self._traj.times[-1]), 1) if is_td else 0.0,
             "playing": self.mode == ArmMode.IMP_TRACK,
             "paused": self._tpaused,
             "progress": (round(self._tplay / self._traj.times[-1], 3)
-                         if self._traj else 0.0),
+                         if is_td else 0.0),
             "rate": round(self._trate, 2),
         }
 

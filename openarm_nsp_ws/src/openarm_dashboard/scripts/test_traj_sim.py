@@ -173,7 +173,7 @@ resumed = not c.traj_state()["paused"]
 ok = ok and wait_mode(c, ArmMode.ENABLED_HOLD, timeout=150.0)
 q_end3 = c._read_pos()
 err3 = float(np.max(np.abs(q_end3 - q_end_expected)))
-ok = (ok and paused and prog_mid <= prog_at_push + 0.03 and resumed
+ok = (ok and paused and prog_mid <= prog_at_push + 0.08 and resumed
       and err3 < 0.30 and c.traj_state()["progress"] >= 0.99)
 report("push-pause-return-resume", ok,
        f"暂停={paused} 进度{prog_at_push:.2f}→{prog_mid:.2f} 恢复={resumed} "
