@@ -799,6 +799,34 @@ class ArmController:
     # ------------------------------------------------- step
     def _step(self) -> None:
         pos, vel, tau, tmos, trotor = self._sense()
+        # ENCODER RE-INDEX GUARD: a failing CAN bus (hw 2026-08-27 06:42 —
+        # right ch1 error storm, bus went silent) made all 7 motors re-acquire
+        # their position estimates with new multi-turn offsets: EVERY joint
+        # "jumped" 0.3–3.1 rad within one 4 ms tick while velocity feedback
+        # read ~0 — physically impossible motion. With gravity comp on, the
+        # model G flipped sign at the new (wrong) q and actively DROVE the
+        # shoulder a full revolution into the body. Guard: any per-tick joint
+        # jump that no joint can physically traverse (>25 rad/s effective)
+        # while the sensed speed is far below it = position estimate corrupt
+        # → kill gravity feedforward immediately (pure torque would be wrong
+        # too — disable the arm) and demand re-enable.
+        if self._last_actual_q is not None and not self.sim:
+            # real hw only: the sim test harness teleports _sim_pos between
+            # scripted poses, which would false-trip the guard
+            step = np.abs(pos - self._last_actual_q)
+            bad = step > 0.1   # >25 rad/s at 250Hz — no joint can do this
+            quiet = np.max(np.abs(vel)) < 8.0     # sensors say we are NOT flying
+            if np.any(bad) and quiet:
+                j = int(np.argmax(step)) + 1
+                self.rs.log(
+                    f"{self.side}: ⛔ 编码器跳变 j{j} +{step.max():.2f}rad/周期"
+                    f"(速度反馈仅{np.max(np.abs(vel)):.1f}rad/s) — 位置估计损坏，"
+                    f"急停。请检查电机/CAN后重新上电使能")
+                self._dump_event("encoder-jump")
+                self._disable()
+                self.mode = ArmMode.DISABLED
+                self.rs.set_mode(self.side, "DISABLED", False)
+                return
         self._last_actual_q = pos
         self._last_actual_dq = vel
         self._last_actual_tau = tau
