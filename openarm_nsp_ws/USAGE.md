@@ -2,7 +2,7 @@
 
 > 路径：`/ros2_ws/openarm_nsp_ws/`
 > 目标机器人：OpenArm v1.0（7-DoF × 2 双臂，达妙电机，CAN-FD）
-> 最后更新：2026-08-27（CAN 线物理交换：LEFT=ch1/RIGHT=ch0，见 §3.3；§18 轨迹回放）
+> 最后更新：2026-08-27（CAN 线物理交换：LEFT=ch1/RIGHT=ch0，见 §3.3）
 
 ---
 
@@ -99,8 +99,8 @@ source install/setup.bash
 | `can_slot1_ch0` | RIGHT |
 
 > ⚠️ **2026-08-27 物理交换了双臂 CAN 线**：现在 LEFT=ch1、RIGHT=ch0（原 ch0=left）。
-> `web_panel`/`hardware_dashboard` 的 `CAN_MAP` 已同步（`CAN_SWAP=True` 开关在
-> web_panel.py:53，换回时改 False）。ros2_control 启动参数也要相应交换。
+> `web_panel`/`hardware_dashboard` 的 `CAN_MAP` 已同步（若换回线材，把两处
+> CAN_MAP 改回 ch0=left 即可）。ros2_control 启动参数也要相应交换。
 
 `hardware_dashboard` / `web_panel` 启动时会自动 `ip link set ... up`（需 root）。CAN 映射
 在两者的 `CAN_MAP`（slot1: 现为 ch1=左 / ch0=右）；`web_panel` 还支持 `--can-slot N` 命令行覆盖
@@ -607,8 +607,6 @@ ros2 run openarm_dashboard web_panel --can-slot 1 --port 8050   # 显式
 | `static/index.html` | ★ web_panel 前端（原生 JS + canvas） |
 | `gravity.py` | ★ 重力补偿 G(q)（pinocchio on v1_simple.urdf） |
 | `impedance.py` | ★ 笛卡尔 6D 阻抗 + sim 动力学被控对象（aba，含 URDF 限位投影挡块） |
-| `traj_rec.py` | ★ 轨迹录制（50Hz 采样+滤波）/ JSON 存取 / 回放重定时（§18） |
-| `scripts/test_traj_sim.py` | ★ 轨迹回放回归 R1-R5（headless） |
 | `scripts/test_impedance_sim.py` | ★ 阻抗+奇异防护 10 项 sim 测试套件（headless） |
 | `scripts/test_impedance_stress.py` | ★ 暴力压测（5 层×2084 场景，分片并行） |
 | `IMPEDANCE_SAFETY.md` | ★ 阻抗安全启动手册（参数含义/安全位姿/奇异防护/调试日志） |
@@ -688,73 +686,3 @@ v5 只淡化失控方向（W=U·diag(σ²/(σ²+0.05²))·Uᵀ 作用于弹簧�
 
 `POST /impedance` — `{side, on, preset, kx, zeta, leak}` 或 `{side, push:[fx,fy,fz], dur}`
 （push 仅 sim）。快照每臂新增 `imp` 字段（on/preset/kx/zeta/leak/dx/dth/fest/qdot）。
-
-## 18. 轨迹录制回放 + 运动中阻抗（IMP_TRACK）★ 新增
-
-拖动录制一段动作 → 存文件 → 缓速平滑回放；回放中受外力则柔顺让位，
-松手回到偏离点继续回放（暂停-回位-继续）。支持从任意点匀速回轨迹起点。
-定点阻抗控制律（§17）完整复用，只是锚点沿轨迹移动。
-
-### 使用流程（每臂独立的"轨迹录制回放"卡片）
-
-1. **录制**：使能 + 零力矩（重力补偿建议开）→ `● 录制` → 手拖机械臂做动作
-   （50Hz 采样，最长 120s）→ `■ 停止并存`。自动后处理：滑动平均滤波
-   （0.15s 窗）→ 均匀重采样 → 首尾静止段裁剪。文件存
-   `log/trajectories/traj_<时间>[_名].json`
-2. **加载**：文件下拉选择（含时长/臂别）→ `加载`。左右臂轨迹不通用（自动拒载）
-3. **回起点**：`⟲ 回起点` — 匀速线性插值，时长 = max|Δq|/0.3rad/s 自适应
-   （12–60s），到位抱住。回放要求距起点 <8.6°
-4. **回放**：选倍率（0.2–1.0x，相对录制速度）和回放阻抗参数（独立于定点阻抗
-   卡片，默认 soft Kx=300 ζ=1.4）→ `▶ 回放`
-   - 首尾各 1s 五次多项式缓入缓出（ease floor 15% 防时钟死锁）
-   - **外力交互**：末端偏离锚点 >5cm → 轨迹时钟暂停（锚点冻结，弹簧只管回位）；
-     回到 <2cm 持续 0.3s → 恢复回放。不追轨迹上的原速点（暂停语义）
-   - 完成 → 抱住终点
-5. **停止**：`■ 停止回放` → 抱住当前位置（可再 `⟲ 回起点` 重新开始）
-
-### 安全（全部继承自阻抗控制）
-
-奇异门禁（起点 σ≥0.05 才允许回放）、计算看门狗、σ 持续硬退出、超速/关节限位
-绊线（实机）——任一触发 → 电机侧 PD 抱住。事件自动转储到 log/panel_<ts>/。
-
-### HTTP 接口
-
-`POST /traj` — `{side, op, name?, rate?, preset?, kx?, zeta?}`，
-op ∈ `record_start | record_stop | load | replay | stop | home | list`。
-快照每臂新增 `traj` 字段（rec/rec_s/loaded/dur/playing/paused/progress/rate）。
-
-### 文件
-
-- `traj_rec.py`：TrajRecorder（采样+滤波）/ TrajData（JSON 存取）/ ease_rate
-- `arm_controller.py`：IMP_TRACK 模式（`_step_imp_track`：时钟推进+锚点移动+
-  复用 `_step_impedance`）、录制采样（50Hz 墙钟门控）、`request_traj`
-- `scripts/test_traj_sim.py`：R1-R5 回归（录制往返/无扰动回放/推离暂停恢复/
-  匀速回起点/奇异门禁）
-
-### 实机测试阶梯
-
-> 完整规程（含测试矩阵、判据、中止信号、已知边界、参数速查）见
-> **TRAJECTORY_TEST.md**。以下为快速指引：
-
-1. 录 10s 简单动作（先肘部屈伸，再复杂的）→ 检查文件时长/点数
-2. `⟲ 回起点` 观察匀速
-3. `▶ 回放` 0.5x 无扰动 → 手感平滑、终点正确
-4. 回放中推开末端 → 软让位 → 松手回位 → 自动继续
-5. 回放中推到极限 → 安全退出（日志可查）
-6. 任意点 `■ 停止回放` + `⟲ 回起点` 重新回放
-
-### 压测结论（TL1-TL6，157 场景，`scripts/test_traj_stress.py`）
-
-| 层 | 场景 | 结果 |
-|---|---|---|
-| TL1 轨迹×倍率×预设 | 27 | 100% OK |
-| TL2 扰动矩阵（时机×力度×时长×方向）| 108 | 94% OK，3 安全退出（正确），3 边缘 |
-| TL3 阈值边界（5cm 附近 chatter/慢推/三连推）| 8 | 无 chatter（暂停/恢复各恰好一次）|
-| TL4 近奇异轨迹 + 推力 | 5 | 防护保持（σ 不破 0.02），末端偏差 9-12°（已知：低σ带径向弹簧按设计淡化）|
-| TL5 快速回放（跟踪滞后假暂停）| 5 | 100% OK——1.0x+soft 无假暂停 |
-| TL6 模型失配 + 推力 | 4 | 100% OK |
-
-已知边界行为（非缺陷）：①回放起始缓入段受 40N 级侧向猛推 → σ 崩塌 → 安全
-退出抱住（回放中止，属设计）；②回放末段仍受推时到达终点 → 抱住在偏移位
-（弹簧仍在，手松开即回）；③轨迹本身穿过低 σ 区时末端跟踪偏差增大（v5 方向
-淡化的设计代价，防护不退出）。录制建议避开把手臂拉直的动作段。
