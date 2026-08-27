@@ -68,3 +68,13 @@ Thumbs.db
 *.tar.gz
 *.tgz
 *.7z
+
+# Virtual environments (whole dirs, not just nested venv/)
+.meshcat_venv/
+.offline_verify/venv/
+
+# Tooling / local caches
+.claude/
+.pytest_cache/
+test_logs/
+recovery_reports/

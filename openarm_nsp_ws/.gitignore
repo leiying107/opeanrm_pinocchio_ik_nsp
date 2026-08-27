@@ -4,3 +4,9 @@ log/
 __pycache__/
 *.pyc
 .vscode/
+
+# virtual env (333M — recreate via install docs, not version control)
+venv-openarm-ik/
+
+# archives
+*.tar.gz

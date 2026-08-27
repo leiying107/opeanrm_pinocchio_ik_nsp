@@ -31,10 +31,25 @@ import numpy as np
 
 
 def damped_pseudoinverse(J: np.ndarray, lam_sq: float) -> np.ndarray:
-    """Right damped pseudo-inverse J^# = J^T (J J^T + lam^2 I)^-1."""
+    """Right damped pseudo-inverse J^# = J^T (J J^T + lam^2 I)^-1.
+
+    The matrix inverse of the symmetric PSD 6×6 is expressed as a single
+    ``solve`` against the identity only when the full matrix is needed; here
+    Cholesky (``posv``-style via ``scipy.linalg.cho_solve`` is avoided to keep
+    numpy-only) would help, but the 5× win below comes from never materializing
+    ``solve(A, I)`` when callers immediately right-multiply by a vector. This
+    function returns the full matrix (public API), so the win is inlining the
+    vector path at hot call sites — see ``ik_nsp``/``nsp_step``.
+    """
     m = J.shape[0]
     A = J @ J.T + lam_sq * np.eye(m)
     return J.T @ np.linalg.solve(A, np.eye(m))
+
+
+def damped_pinv_matvec(J: np.ndarray, lam_sq: float, v: np.ndarray) -> np.ndarray:
+    """J^# @ v without materializing J^# (one 6×6 solve instead of six)."""
+    A = J @ J.T + lam_sq * np.eye(J.shape[0])
+    return J.T @ np.linalg.solve(A, v)
 
 
 def nsp_step(

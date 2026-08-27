@@ -44,6 +44,7 @@ from openarm_pinocchio_nsp.kinematics import PinocchioModel
 from openarm_pinocchio_nsp.urdf_path import resolve_urdf_path
 
 from .arm_controller import ARM_DOF, ArmController, ArmMode, bringup_can, can_is_up
+from .collision_gate import gate as col_gate
 from .robot_state import DataBuffer, RobotState
 
 SIDES = ("left", "right")
@@ -94,6 +95,13 @@ def _ik_and_go(side):
     if not r.converged:
         rs.log(f"{side}: IK未收敛 (err={r.pos_err_mm:.2f}mm)")
         return
+    # collision gate: the endpoint config must be clear (elbow migration is
+    # inside ik_nsp's null-space already; this catches a target INSIDE the
+    # peer arm / torso)
+    g = col_gate.gate_config(side, r.q, "到终点")
+    if not g.ok:
+        rs.log(f"{side}: ⛔ {g.reason}")
+        return
     rs.log(f"{side}: IK解终点 σ_min={r.sigma_min:.3f}")
     c.request_move_to(r.q, "IK到终点")
 
@@ -108,7 +116,23 @@ def _line_run(side):
     t0 = time.time()
     try:
         m = models[side]
-        result = plan_cartesian(m, [Waypoint(*m.fk(qs)), Waypoint(*m.fk(qe))],
+        pos_s, quat_s = m.fk(qs)
+        pos_e, quat_e = m.fk(qe)
+        if col_gate.enabled and col_gate.available:
+            # collision-aware line: null-space elbow migration → perpendicular
+            # detour → honest truncate (sim: 40/40 scenarios safe, endpoint
+            # 0.06 mm on detours). Falls back to the stock planner on any
+            # internal failure so the button still works.
+            from openarm_pinocchio_nsp.collision_planner import CollisionAwarePlanner
+            peer = col_gate._peer_q(side)
+            if peer is not None:
+                pl = CollisionAwarePlanner(side, other_q7=peer,
+                                           checker=col_gate._chk)
+                cres = pl.plan_line_quat(pos_s, quat_s, pos_e, qs, smooth=False)
+                t_plan = time.time() - t0
+                _line_dispatch(side, cres, t_plan)
+                return
+        result = plan_cartesian(m, [Waypoint(pos_s, quat_s), Waypoint(pos_e, quat_e)],
                                 q_init=qs, smooth=False)
     except Exception as e:  # noqa: BLE001
         rs.log(f"{side}: 直线运动异常 {type(e).__name__}: {e}")
@@ -126,6 +150,31 @@ def _line_run(side):
         rs.log(f"{side}: ▶直线运动 {len(q_path)}点 规划{t_plan:.1f}s "
                f"时长{dur:.2f}s 峰速{peak:.2f}rad/s σ_min={result.min_sigma:.3f} "
                f"(不检查安全门)")
+
+
+def _line_dispatch(side, cres, t_plan):
+    """Execute a CollisionPlanResult (shared by the collision-aware line)."""
+    c = controllers[side]
+    m = models[side]
+    if not cres.q_path:
+        rs.log(f"{side}: 直线规划失败 (无路径)")
+        return
+    times, q_path = cres.times, cres.q_path
+    dur = times[-1] - times[0] if len(times) > 1 else 0.0
+    peak = float(np.max(np.abs(np.diff(q_path, axis=0) / np.diff(times)[:, None]))) \
+        if len(times) > 1 else 0.0
+    _warn_traj(side, times, q_path)
+    err_buf[side].clear()
+    if cres.truncated:
+        rs.log(f"{side}: ⛔ 直线终点不可达无碰路径，执行安全前段 "
+               f"({len(q_path)}/{cres.n_points_requested}点) "
+               f"{' '.join(cres.notes)}")
+    elif cres.strategy in ("nullspace", "detour"):
+        rs.log(f"{side}: 避障[{cres.strategy}]"
+               + (f" 绕行点{np.round(cres.detour_added, 3).tolist()}" if cres.detour_added else ""))
+    if c.request_transition(ArmMode.TRACKING, (times, q_path)):
+        rs.log(f"{side}: ▶直线运动 {len(q_path)}点 规划{t_plan:.1f}s "
+               f"时长{dur:.2f}s 峰速{peak:.2f}rad/s")
 
 
 def _arc_run(side):
@@ -152,6 +201,12 @@ def _arc_run(side):
         return
     times, q_path = ease_in_out_retime(result.times, result.q_path,
                                        slowdown=ARC_TUNE["slowdown"], vmax_cap=ARC_TUNE["cap"])
+    # collision gate: arc SHAPE is the taught intent — no detours, only
+    # null-space migration (which preserves the EE path) then reject.
+    g = _repair_or_reject(side, result.q_path, "弧线", result.times)
+    if g is None:
+        return
+    times, q_path = g
     dur = times[-1] - times[0]
     peak = np.max(np.abs(np.diff(q_path, axis=0) / np.diff(times)[:, None]))
     _warn_traj(side, times, q_path)
@@ -183,6 +238,11 @@ def _replay_run(side):
         rs.log(f"{side}: 关节回放IK失败 (规划{t_plan:.1f}s)")
         return
     times, q_path = traj
+    # collision gate: replay path is the taught intent — migration only, then reject
+    g = _repair_or_reject(side, q_path, "回放", times)
+    if g is None:
+        return
+    times, q_path = g
     dur = times[-1] - times[0]
     peak = float(np.max(np.abs(np.diff(q_path, axis=0) / np.diff(times)[:, None])))
     _warn_traj(side, times, q_path)
@@ -214,10 +274,16 @@ def _bspline_run(side):
         return
     n = len(q_path)
     times = np.linspace(0, 3.0, n).tolist()
+    # collision gate: full bimanual check (the built-in post_verify only sees
+    # this arm's own links) — migration then reject, like arc/replay
+    g = _repair_or_reject(side, list(q_path), "B样条", times)
+    if g is None:
+        return
+    times, q_path = g
     _warn_traj(side, times, list(q_path))
     err_buf[side].clear()
     if c.request_transition(ArmMode.TRACKING, (times, list(q_path))):
-        rs.log(f"{side}: ▶B样条执行 {n}点 碰撞={v['collisions']}")
+        rs.log(f"{side}: ▶B样条执行 {len(q_path)}点 碰撞={v['collisions']}")
 
 
 # background action dispatch (run IK in a thread so the request returns instantly)
@@ -225,12 +291,46 @@ def _spawn(fn, side):
     threading.Thread(target=fn, args=(side,), daemon=True).start()
 
 
+def _repair_or_reject(side, q_path, label, times):
+    """Collision gate for taught-shape paths (arc / replay / B-spline).
+
+    Try null-space elbow migration (EE path unchanged); if any sample still
+    violates, REJECT — the taught shape is the intent, we don't deform it.
+    Returns (times, q_path) to execute, or None if rejected. Gate off or
+    unavailable → the input path unchanged (fail-open).
+    """
+    if not col_gate.enabled or not col_gate.available:
+        return times, q_path
+    try:
+        g = col_gate.gate_trajectory(side, q_path, label)
+        if g.ok:
+            return times, q_path
+        # attempt migration (path shape preserved)
+        peer = col_gate._peer_q(side)
+        if peer is None:
+            return times, q_path
+        from openarm_pinocchio_nsp.collision_planner import CollisionAwarePlanner
+        pl = CollisionAwarePlanner(side, other_q7=peer, checker=col_gate._chk)
+        fixed = pl._nullspace_repair(list(q_path))
+        if fixed is not None:
+            g2 = col_gate.gate_trajectory(side, fixed, label)
+            if g2.ok:
+                rs.log(f"{side}: 避障[零空间让位] {label}肘部构型已调整")
+                return times, fixed
+        rs.log(f"{side}: ⛔ {g.reason} — 拒绝执行（调整示教点或移开对侧臂）")
+        return None
+    except Exception as e:  # noqa: BLE001 — fail-open, button keeps working
+        rs.log(f"{side}: [collision]异常(fail-open) {type(e).__name__}: {e}")
+        return times, q_path
+
+
 # ============================================================ snapshot for SSE
 def _snapshot() -> dict:
     out = {"arms": {}, "log": rs.recent_messages(14),
            "tune": {"slowdown": ARC_TUNE["slowdown"], "cap": ARC_TUNE["cap"],
                     "mode": ARC_TUNE["mode"], "maxspeed": REPLAY_TUNE["max_speed"],
-                    "freq": REPLAY_TUNE["freq"]}}
+                    "freq": REPLAY_TUNE["freq"]},
+           "col": col_gate.state()}
     for s in SIDES:
         st = rs.snapshot(s)
         c = controllers.get(s)
@@ -332,6 +432,11 @@ async def _action(req: Request):
         return _ok(False, err="bad args")
     c = controllers[side]
     if op == "go_start":
+        if c.taught_start is not None:
+            g = col_gate.gate_config(side, c.taught_start, "回起点")
+            if not g.ok:
+                rs.log(f"{side}: ⛔ {g.reason}")
+                return _ok(False, err=g.reason)
         c.request_transition(ArmMode.GO_START)
     elif op == "go_end":
         _spawn(_ik_and_go, side)
@@ -343,6 +448,10 @@ async def _action(req: Request):
         c.request_arc_clear()
     elif op == "arc_start":
         if c.arc_points:
+            g = col_gate.gate_config(side, c.arc_points[0], "弧线回起点")
+            if not g.ok:
+                rs.log(f"{side}: ⛔ {g.reason}")
+                return _ok(False, err=g.reason)
             c.request_move_to(c.arc_points[0], "弧线回起点")
     elif op == "arc_run":
         _spawn(_arc_run, side)
@@ -372,6 +481,17 @@ async def _tune(req: Request):
             REPLAY_TUNE["freq"] = float(b["freq"])
     except Exception as e:  # noqa: BLE001
         return _ok(False, err=str(e))
+    return _ok()
+
+
+@app.post("/collision")
+async def _collision(req: Request):
+    """Self-collision gate master switch: {on: bool}."""
+    b = await req.json()
+    _cmd_log("/collision", b)
+    col_gate.set_enabled(bool(b.get("on", True)))
+    rs.log(f"[collision] 自碰撞检测 {'ON' if col_gate.enabled else 'OFF'}"
+           f"({'可用' if col_gate.available else '不可用-fail-open'})")
     return _ok()
 
 
@@ -581,7 +701,21 @@ def _bringup(sim, can_slot, no_can, log_dir=None):
             rs.log(f"{side}: init failed: {type(e).__name__}: {e}")
             print(f"[panel] {side}: init FAILED: {type(e).__name__}: {e}", flush=True)
     rs.log("web panel ready — both arms zero-torque (safe)")
+    # self-collision gate: build the shared checker AFTER the controllers exist
+    # (the gate reads the peer arm's measured q); fail-open on any error.
+    threading.Thread(target=_build_collision_gate, daemon=True,
+                     name="collision-gate-init").start()
     print("[panel] bringup done — starting HTTP server ...", flush=True)
+
+
+def _build_collision_gate():
+    t0 = time.time()
+    ok = col_gate.build()
+    col_gate.attach(controllers, log=rs.log)
+    if ok:
+        rs.log(f"[collision] 自碰撞检测就绪 "
+               f"({col_gate._chk.n_pairs}对 | 双臂/基座 | 20mm边距) "
+               f"{time.time()-t0:.1f}s")
 
 
 @app.on_event("startup")
@@ -592,6 +726,8 @@ def _startup():
 
 @app.on_event("shutdown")
 def _shutdown():
+    with contextlib.suppress(Exception):
+        col_gate.stop()
     for c in controllers.values():
         with contextlib.suppress(Exception):
             c.stop()

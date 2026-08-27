@@ -31,7 +31,7 @@ from dataclasses import dataclass
 import numpy as np
 import pinocchio as pin
 
-from .ik_nsp import damped_pseudoinverse
+from .ik_nsp import damped_pinv_matvec, damped_pseudoinverse
 
 
 @dataclass
@@ -257,7 +257,7 @@ class PinocchioModel:
                 break
             sigma_min = float(np.linalg.svd(J, compute_uv=False)[-1])
             lam_sq = lambda0**2 + kd * max(0.0, sigma_eps - sigma_min) ** 2
-            dq = damped_pseudoinverse(J, lam_sq) @ err
+            dq = damped_pinv_matvec(J, lam_sq, err)
             q7 = np.clip(q7 + dq, self.lower, self.upper)
 
         if not converged:
@@ -285,13 +285,15 @@ class PinocchioModel:
         for _ in range(null_iters):
             grad_w = self._manipulability_grad(q7)
             J = self.jacobian6(q7)
-            P = np.eye(7) - damped_pseudoinverse(J, lambda0**2) @ J
             # secondary velocity: manipulability gradient + limit-avoidance
             # (joints near a limit get an exponentially stronger pull to center)
             margin = np.minimum(q7 - self.lower, self.upper - q7)
             dq_sec = kw * grad_w + kc * (np.exp(-margin / 0.3) * (q_center - q7))
+            # P @ dq_sec without materializing P: P v = v - J^# (J v), with J^#
+            # applied by a single 6×6 solve (the matrix form costs 6 solves here).
+            P_dq_sec = dq_sec - damped_pinv_matvec(J, lambda0**2, J @ dq_sec)
             q_try = np.clip(
-                q7 + null_step * (P @ dq_sec), self.lower, self.upper
+                q7 + null_step * P_dq_sec, self.lower, self.upper
             )
             oMf_try, _ = self._pose_and_jac(q_try)
             err_try = float(
