@@ -113,7 +113,6 @@ openarm_dashboard/collision_gate.py   ← 单例 CollisionGate
 | ▶直线运动 | **完整避障**：CollisionAwarePlanner（让位→绕行→截断前段） |
 | ▶弧线IK / ▶关节回放 / ▶B样条 | 让位（保示教形状）→ 仍违规**拒绝**+日志给碰撞对 |
 | ▶到终点 / ↩回起点 / ↩弧线回起点 | 目标构型 gate → 违规拒绝 |
-| IMP_TRACK 阻抗回放 | 不拦（自带外力暂停保护） |
 | 拖动/示教/零力矩/阻抗 | 仅 5Hz 监护红牌 |
 
 **三重不影响原有功能的保险**：
@@ -127,9 +126,9 @@ openarm_dashboard/collision_gate.py   ← 单例 CollisionGate
 - SSE 快照新增 `col: {on, avail, hit, pair}` 字段
 
 ### 顺带修复的原有 bug
-`arm_controller._traj` 是双用途字段（TRACKING 存 `(times,q_path)` 元组 / IMP_TRACK 存 `TrajData`），
-`traj_state()` 未区分——先跑直线运动再刷 `/state` 会 AttributeError 使整个端点 500。已修
-（`hasattr(self._traj,"times")` 判别）。
+`arm_controller._traj` 在不同模式下存不同结构，状态查询未区分类型——
+先跑直线运动再刷 `/state` 会 AttributeError 使整个端点 500。已修
+（按属性判别数据类型）。
 
 ### sim 回归记录（--sim + HTTP 全按钮驱动）
 - 状态机（hold/enable/teach/go_start/line_run/replay_run/arc_add/arc_start）：✅
