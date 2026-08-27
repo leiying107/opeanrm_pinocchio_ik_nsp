@@ -44,7 +44,8 @@ from .arm_controller import (ARM_DOF, ArmController, ArmMode, bringup_can,
                               can_is_up)
 from .robot_state import DataBuffer, RobotState
 
-CAN_MAP = {"left": "can_slot1_ch0", "right": "can_slot1_ch1"}  # ch0=left, ch1=right; slot overridable via --can-slot
+# channel map SWAPPED 2026-08-27 (cables physically exchanged): left=ch1
+CAN_MAP = {"left": "can_slot1_ch1", "right": "can_slot1_ch0"}
 SIDES = ("left", "right")
 
 # mode buttons (simple transitions)
@@ -567,11 +568,11 @@ def main() -> int:
     ap.add_argument("--no-can", action="store_true")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--can-slot", type=int, default=1,
-                    help="CAN card slot number; left=ch0, right=ch1 (default 1)")
+                    help="CAN card slot number; left=ch1, right=ch0 (swapped 2026-08-27; default 1)")
     args = ap.parse_args()
     global CAN_MAP
-    CAN_MAP = {"left": f"can_slot{args.can_slot}_ch0",
-               "right": f"can_slot{args.can_slot}_ch1"}
+    CAN_MAP = {"left": f"can_slot{args.can_slot}_ch1",   # swapped 2026-08-27
+               "right": f"can_slot{args.can_slot}_ch0"}
 
     rs = RobotState(SIDES)
     buf = DataBuffer(SIDES, maxlen=200)

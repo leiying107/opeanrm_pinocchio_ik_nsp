@@ -48,7 +48,11 @@ from .collision_gate import gate as col_gate
 from .robot_state import DataBuffer, RobotState
 
 SIDES = ("left", "right")
-CAN_MAP = {"left": "can_slot1_ch0", "right": "can_slot1_ch1"}  # ch0=left, ch1=right; --can-slot overrides
+# CAN channel map. SWAPPED 2026-08-27: the arms' CAN cables were physically
+# exchanged, so LEFT now lives on ch1 and RIGHT on ch0 (previously ch0=left).
+CAN_SWAP = True   # set False if the cables are ever swapped back
+CAN_MAP = ({"left": "can_slot1_ch1", "right": "can_slot1_ch0"} if CAN_SWAP
+           else {"left": "can_slot1_ch0", "right": "can_slot1_ch1"})
 
 # live-tunable (mirrors hardware_dashboard)
 ARC_TUNE = {"slowdown": 2.0, "cap": 1.0, "mode": "fast"}
@@ -663,7 +667,11 @@ def _bringup(sim, can_slot, no_can, log_dir=None):
     global rs, buf, CAN_MAP
     rs = RobotState(SIDES)
     buf = DataBuffer(SIDES, maxlen=400)
-    CAN_MAP = {"left": f"can_slot{can_slot}_ch0", "right": f"can_slot{can_slot}_ch1"}
+    # respect CAN_SWAP (see the module-level comment): after the 2026-08-27
+    # cable exchange left=ch1/right=ch0
+    CAN_MAP = ({"left": f"can_slot{can_slot}_ch1", "right": f"can_slot{can_slot}_ch0"}
+               if CAN_SWAP else
+               {"left": f"can_slot{can_slot}_ch0", "right": f"can_slot{can_slot}_ch1"})
     log_dir = _setup_logging(sim, can_slot, log_dir)
     if not sim:
         threading.Thread(target=_can_sampler,

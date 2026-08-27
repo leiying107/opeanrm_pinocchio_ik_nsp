@@ -2,7 +2,7 @@
 
 > 路径：`/ros2_ws/openarm_nsp_ws/`
 > 目标机器人：OpenArm v1.0（7-DoF × 2 双臂，达妙电机，CAN-FD）
-> 最后更新：2026-08-21（§18 轨迹录制回放 + 运动中阻抗 IMP_TRACK；阻抗 v8 见 IMPEDANCE_THEORY.md）
+> 最后更新：2026-08-27（CAN 线物理交换：LEFT=ch1/RIGHT=ch0，见 §3.3；§18 轨迹回放）
 
 ---
 
@@ -95,15 +95,19 @@ source install/setup.bash
 
 | 接口 | 臂 |
 |------|----|
-| `can_slot1_ch0` | LEFT |
-| `can_slot1_ch1` | RIGHT |
+| `can_slot1_ch1` | LEFT |
+| `can_slot1_ch0` | RIGHT |
+
+> ⚠️ **2026-08-27 物理交换了双臂 CAN 线**：现在 LEFT=ch1、RIGHT=ch0（原 ch0=left）。
+> `web_panel`/`hardware_dashboard` 的 `CAN_MAP` 已同步（`CAN_SWAP=True` 开关在
+> web_panel.py:53，换回时改 False）。ros2_control 启动参数也要相应交换。
 
 `hardware_dashboard` / `web_panel` 启动时会自动 `ip link set ... up`（需 root）。CAN 映射
-在两者的 `CAN_MAP`（slot1: ch0=左 / ch1=右）；`web_panel` 还支持 `--can-slot N` 命令行覆盖
+在两者的 `CAN_MAP`（slot1: 现为 ch1=左 / ch0=右）；`web_panel` 还支持 `--can-slot N` 命令行覆盖
 （默认 1），硬件换槽时直接传参即可，不用改代码。
 
 > ⚠️ **`openarm.bimanual.launch.py` 的默认 left/right 是反的**（默认 right=ch0/left=ch1）。
-> 如果你同时跑 ros2_control，必须显式传 `left_can_interface:=can_slot1_ch0 right_can_interface:=can_slot1_ch1`。
+> 如果你同时跑 ros2_control，必须显式传 `left_can_interface:=can_slot1_ch1 right_can_interface:=can_slot1_ch0`（2026-08-27 交换后）。
 
 ---
 
