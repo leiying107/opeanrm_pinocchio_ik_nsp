@@ -188,6 +188,7 @@ class ArmController:
         self._traj = None              # loaded TrajData
         self._traj_name = ""
         self._kr_saved = None          # pre-replay Kr (restored on exit)
+        self._mode_t0 = 0.0            # last enable time (guard settle window)
         self._tplay = 0.0              # replay clock (trajectory seconds)
         self._tpaused = False
         self._tresume_ct = 0
@@ -756,6 +757,8 @@ class ArmController:
             self.oa.get_arm().mit_control_all(zero)
             self.oa.recv_all()
         self.enabled = True
+        # telemetry settle window for the encoder-jump guard (see _step)
+        self._mode_t0 = time.monotonic()
 
     def _disable(self) -> None:
         self.gravity_on = False
@@ -812,19 +815,28 @@ class ArmController:
         # too — disable the arm) and demand re-enable.
         if self._last_actual_q is not None and not self.sim:
             # real hw only: the sim test harness teleports _sim_pos between
-            # scripted poses, which would false-trip the guard
-            step = np.abs(pos - self._last_actual_q)
-            bad = step > 0.1   # >25 rad/s at 250Hz — no joint can do this
-            quiet = np.max(np.abs(vel)) < 8.0     # sensors say we are NOT flying
-            if np.any(bad) and quiet:
-                j = int(np.argmax(step)) + 1
-                self.rs.log(
-                    f"{self.side}: ⛔ 编码器跳变 j{j} +{step.max():.2f}rad/周期"
-                    f"(速度反馈仅{np.max(np.abs(vel)):.1f}rad/s) — 位置估计损坏，"
-                    f"急停。请检查电机/CAN后重新上电使能")
-                self._dump_event("encoder-jump")
-                self._disable()
-                self.mode = ArmMode.DISABLED
+            # scripted poses, which would false-trip the guard. SKIP the first
+            # 0.5 s after any transition into an enabled mode: the position
+            # baseline is stale there (motors report zeros until the first
+            # telemetry frame lands — hw 2026-08-27 07:34: every enable
+            # false-tripped on the resting j7 offset vs the zero baseline and
+            # disabled the arm instantly, "cannot enable")
+            settled = (time.monotonic() - self._mode_t0) > 0.5
+            if settled and self.enabled:
+                step = np.abs(pos - self._last_actual_q)
+                bad = step > 0.1   # >25 rad/s at 250Hz — no joint can do this
+                quiet = np.max(np.abs(vel)) < 8.0  # sensors say NOT flying
+                if np.any(bad) and quiet:
+                    j = int(np.argmax(step)) + 1
+                    self.rs.log(
+                        f"{self.side}: ⛔ 编码器跳变 j{j} +{step.max():.2f}rad/周期"
+                        f"(速度反馈仅{np.max(np.abs(vel)):.1f}rad/s) — 位置估计损坏，"
+                        f"急停。请检查电机/CAN后重新上电使能")
+                    self._dump_event("encoder-jump")
+                    self._disable()
+                    self.mode = ArmMode.DISABLED
+                    self.rs.set_mode(self.side, "DISABLED", False)
+                    return
                 self.rs.set_mode(self.side, "DISABLED", False)
                 return
         self._last_actual_q = pos
